@@ -1,0 +1,25 @@
+[Unit]
+Description=SenseVoice ASR API Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/senseaudio
+ExecStart=/usr/bin/python3 /opt/senseaudio/main.py --host 0.0.0.0 --port 8000 --gpu 5
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=senseaudio
+Environment=PYTHONUNBUFFERED=1
+
+# 安全设置
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target 

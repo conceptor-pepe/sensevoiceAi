@@ -1,0 +1,12 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+python-multipart==0.0.20
+torch>=2.7.0+cu126
+onnxruntime-gpu>=1.21.1
+funasr-onnx>=0.4.1
+librosa==0.11.0
+soundfile==0.12.1
+numpy==1.26.4
+loguru==0.7.2
+diskcache==5.6.1
+python-dotenv==1.0.0 
