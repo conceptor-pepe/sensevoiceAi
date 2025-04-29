@@ -1,37 +1,7 @@
-# Web框架和服务器
-fastapi==0.103.1  # FastAPI Web框架
-uvicorn[standard]==0.23.2  # ASGI服务器
-pydantic==2.3.0  # 数据验证
-starlette==0.27.0  # ASGI框架
-python-multipart==0.0.6  # 处理multipart/form-data
-pydantic-settings==2.0.2  # 配置管理
-
-# 机器学习相关
-numpy==1.24.4  # 科学计算库 (符合<=1.26.4的要求)
-gradio  # 快速创建ML演示界面 (新增依赖)
-torch>=1.10.0  # PyTorch 深度学习框架
-torchaudio>=0.10.0  # PyTorch音频处理库
-soundfile>=0.12.1  # 音频文件读写
-funasr_onnx>=0.2.0  # FunASR ONNX版本
-funasr_torch>=0.2.0  # FunASR PyTorch版本
-
-# 数据存储和缓存
-redis==4.6.0  # Redis客户端
-hiredis==2.2.3  # Redis协议解析器
-
-# 文件和配置
-aiofiles==23.2.1  # 异步文件操作
-python-dotenv==1.0.0  # 环境变量管理
-
-# 系统和监控
-psutil==5.9.5  # 系统和进程监控
-prometheus-client==0.17.1  # 监控指标收集
-GPUtil==1.4.0  # GPU监控
-nvidia-ml-py3==7.352.0  # NVIDIA GPU监控
-
-# 网络通信
-httpx==0.25.0  # HTTP客户端
-websockets==11.0.3  # WebSocket支持
-
-# 其他工具
-statistics==1.0.3.5  # 统计计算
+fastapi>=0.95.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+torch>=2.0.0
+torchaudio>=2.0.0
+typing-extensions>=4.5.0
