@@ -1,195 +1,174 @@
-# SenseVoice API - 轻量级语音识别服务
+# SenseVoice API 服务
 
-## 项目简介
-
-SenseVoice API 是一个基于 FastAPI 的轻量级语音识别服务，使用内存队列实现了异步任务处理，提供了简洁的 API 接口进行语音识别。该服务专为 SenseVoice 模型设计，支持高效的语音转文本能力。
+基于SenseVoice Small模型的ONNX部署API服务。
 
 ## 功能特点
 
-- 基于 FastAPI 的同步 API 接口，内部异步处理
-- 内存队列实现，无需额外依赖 Redis 等外部服务
-- 多工作器并行处理，提高吞吐量
-- 自动管理任务生命周期
-- 简单易用的 API 接口
+- 基于ONNX Runtime优化推理速度
+- 支持特定GPU设备指定
+- 提供同步REST API接口
+- 支持多种音频输入方式（文件上传和Base64编码）
+- 返回识别文本、语言类型、情绪和事件信息
 
 ## 环境要求
 
 - Python 3.8+
-- SenseVoice 模型
-- CUDA 支持（用于模型推理，推荐）
-- PyTorch 和 TorchAudio
+- CUDA 11.0+（GPU加速）
+- 足够的内存和磁盘空间用于模型加载
 
-## 安装步骤
+## 安装依赖
 
-1. 克隆代码仓库
-```bash
-git clone <仓库地址>
-cd sensevoice-api
-```
-
-2. 安装依赖
 ```bash
 pip install -r requirements.txt
 ```
 
-## 使用方法
+## 运行服务
 
-### 配置环境变量
-
-可以通过环境变量自定义服务配置：
-
-- `SENSEVOICE_MODEL_DIR`: SenseVoice 模型目录，默认为 "iic/SenseVoiceSmall"
-- `SENSEVOICE_DEVICE`: 使用的设备，默认为 "cuda:0"
-- `SENSEVOICE_WORKERS`: 工作器数量，默认为 4
-- `SENSEVOICE_TIMEOUT`: 任务超时时间(秒)，默认为 30
-- `SENSEVOICE_MAX_QUEUE`: 最大队列长度，默认为 100
-
-### 启动服务
-
-使用提供的启动脚本：
+### 方法1：直接运行
 
 ```bash
-# 使用默认配置
+# 赋予启动脚本执行权限
+chmod +x start.sh
+
+# 使用默认配置启动
 ./start.sh
 
-# 指定设备和工作器数量
-./start.sh --device cuda:1 --workers 8
+# 或者自定义配置
+SENSEVOICE_GPU_DEVICE=1 SENSEVOICE_PORT=8080 ./start.sh
 ```
 
-或者直接启动：
+### 方法2：Docker部署
 
 ```bash
-# 启动服务
-uvicorn api:app --host 0.0.0.0 --port 8000
+# 构建Docker镜像
+docker build -t sensevoice-api .
+
+# 运行容器
+docker run --gpus '"device=0"' -p 8000:8000 sensevoice-api
+
+# 或者自定义配置
+docker run --gpus '"device=1"' -p 8080:8000 \
+  -e SENSEVOICE_GPU_DEVICE=1 \
+  -e SENSEVOICE_PORT=8000 \
+  -e SENSEVOICE_MODEL_DIR="iic/SenseVoiceSmall" \
+  sensevoice-api
 ```
 
-## API 接口说明
+## 环境变量配置
 
-### 语音识别接口
+| 环境变量 | 说明 | 默认值 |
+|---------|------|--------|
+| SENSEVOICE_MODEL_DIR | 模型目录 | iic/SenseVoiceSmall |
+| SENSEVOICE_GPU_DEVICE | GPU设备ID | 0 |
+| SENSEVOICE_HOST | 监听地址 | 0.0.0.0 |
+| SENSEVOICE_PORT | 监听端口 | 8000 |
+| SENSEVOICE_BATCH_SIZE | 批处理大小 | 1 |
+
+## API接口
+
+### 1. 健康检查
 
 ```
-POST /asr
+GET /
 ```
 
-参数：
-- `files`: 音频文件列表 (multipart/form-data)
-- `language`: 语言（可选，默认为 "auto"）
+响应示例：
 
-返回：任务ID
 ```json
 {
-  "task_id": "任务唯一标识符"
+  "status": "ok",
+  "message": "SenseVoice API服务运行正常"
 }
 ```
 
-### 获取结果接口
+### 2. 语音识别
 
 ```
-GET /result/{task_id}
+POST /recognize
 ```
 
-参数：
-- `task_id`: 任务ID（路径参数）
+#### 支持两种请求方式：
 
-返回：识别结果
+1. **表单上传**：直接上传音频文件
+
+   请求参数：
+   - audio_file: 音频文件（支持多种格式）
+   - language: 语言代码（可选，默认"auto"）
+   - use_itn: 是否使用ITN（可选，默认为true）
+
+2. **JSON请求**：使用Base64编码音频
+
+   请求参数：
+   - request_data: JSON字符串，包含以下字段：
+     - audio_base64: Base64编码的音频数据
+     - language: 语言代码（可选，默认"auto"）
+     - use_itn: 是否使用ITN（可选，默认为true）
+
+#### 响应格式：
+
 ```json
 {
-  "text": "识别出的文本",
-  "task_id": "任务唯一标识符"
+  "success": true,
+  "message": "识别成功",
+  "text": "识别出的文本内容",
+  "language": "zh",
+  "emotion": "NEUTRAL",
+  "event": "Speech",
+  "time_cost": 1.23
 }
 ```
-
-## 工作原理
-
-1. **初始化阶段**：
-   - 创建多个工作器线程，共享内存存储
-   - 根据配置分配 GPU 资源
-
-2. **处理流程**：
-   - 客户端发送请求到 `/asr` 接口
-   - API 服务将任务添加到内存队列并返回任务ID
-   - 工作器从队列获取任务并处理
-   - 工作器将语音识别结果存入内存存储
-   - 客户端通过 `/result/{task_id}` 接口获取结果
-
-3. **资源管理**：
-   - 任务结果在指定时间后自动清理
-   - 任务队列大小可配置，防止内存溢出
 
 ## 使用示例
 
-### Python 客户端
+### Python请求示例
 
 ```python
 import requests
-import time
+import base64
 
-# 提交语音识别请求
-url = "http://localhost:8000/asr"
-files = [
-    ('files', ('audio1.wav', open('audio1.wav', 'rb'), 'audio/wav'))
-]
-data = {
-    'language': 'auto'
-}
+# 方法1：上传音频文件
+with open("audio.wav", "rb") as f:
+    response = requests.post(
+        "http://localhost:8000/recognize",
+        files={"audio_file": f},
+        data={"language": "auto", "use_itn": "true"}
+    )
+    print(response.json())
 
-response = requests.post(url, files=files, data=data)
-task_id = response.json()["task_id"]
-
-# 获取结果
-result_url = f"http://localhost:8000/result/{task_id}"
-while True:
-    response = requests.get(result_url)
-    if response.status_code == 200:
-        result = response.json()
-        print(f"识别结果: {result['text']}")
-        break
-    elif response.status_code == 404:
-        print("等待结果...")
-        time.sleep(1)
-    else:
-        print(f"错误: {response.status_code}")
-        break
+# 方法2：Base64编码音频
+with open("audio.wav", "rb") as f:
+    audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+    
+    json_data = {
+        "audio_base64": audio_base64,
+        "language": "auto",
+        "use_itn": True
+    }
+    
+    response = requests.post(
+        "http://localhost:8000/recognize",
+        data={"request_data": json.dumps(json_data)}
+    )
+    print(response.json())
 ```
 
-### cURL 示例
+### curl示例
 
 ```bash
-# 提交语音识别请求
-TASK_ID=$(curl -s -X POST "http://localhost:8000/asr" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "files=@audio1.wav" \
-  -F "language=auto" | jq -r '.task_id')
+# 上传音频文件
+curl -X POST http://localhost:8000/recognize \
+  -F "audio_file=@audio.wav" \
+  -F "language=auto" \
+  -F "use_itn=true"
 
-echo "任务ID: $TASK_ID"
-
-# 获取结果
-curl -X GET "http://localhost:8000/result/$TASK_ID" \
-  -H "accept: application/json"
+# Base64编码请求
+curl -X POST http://localhost:8000/recognize \
+  -F 'request_data={"audio_base64":"BASE64_ENCODED_AUDIO_DATA", "language":"auto", "use_itn":true}'
 ```
 
-## 性能优化
+## 注意事项
 
-1. **增加工作器数量**：
-   通过 `SENSEVOICE_WORKERS` 环境变量调整，建议根据 GPU 内存和 CPU 核心数设置
-
-2. **调整队列大小**：
-   通过 `SENSEVOICE_MAX_QUEUE` 环境变量调整最大队列长度，需根据内存大小和预期负载设置
-
-3. **使用更快的设备**：
-   设置 `SENSEVOICE_DEVICE=cuda:0` 使用 GPU 加速，提高处理速度
-
-## 常见问题
-
-1. **服务启动失败**：
-   - 确认模型目录路径正确
-   - 检查 CUDA 环境和 GPU 可用性
-
-2. **任务超时问题**：
-   - 增加 `SENSEVOICE_TIMEOUT` 值
-   - 减少工作器数量以减轻负载
-
-3. **内存使用过高**：
-   - 减小 `SENSEVOICE_MAX_QUEUE` 值
-   - 减少并发请求数量
+1. 请确保您有足够的GPU内存来加载模型
+2. 对于长音频文件，处理时间会相应增加
+3. 临时文件存储在`/tmp`目录下，请确保有足够的空间
+4. 服务在处理完请求后会自动清理临时文件 

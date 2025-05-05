@@ -1,7 +1,7 @@
-fastapi>=0.95.0
-uvicorn>=0.22.0
-python-multipart>=0.0.6
-pydantic>=2.0.0
-torch>=2.0.0
-torchaudio>=2.0.0
-typing-extensions>=4.5.0
+funasr
+funasr-onnx
+fastapi
+uvicorn
+python-multipart
+numpy
+onnxruntime-gpu 
