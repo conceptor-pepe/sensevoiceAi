@@ -46,7 +46,7 @@ class ModelManager:
         """
         try:
             stats = TimeStats(prefix="model_load")
-            logger.info(f"[{stats.request_id}] 正在加载SenseVoice Small模型，模型目录: {config.MODEL_DIR}, 使用GPU: {config.GPU_DEVICE}")
+            logger.info(f"[{stats.request_id}] loading SenseVoice Small model, model dir: {config.MODEL_DIR}, using GPU: {config.GPU_DEVICE}")
             
             # 加载模型
             self._model = SenseVoiceSmall(
@@ -57,11 +57,11 @@ class ModelManager:
             
             # 记录加载时间
             load_time = stats.total_time()
-            logger.info(f"[{stats.request_id}] 模型加载成功，耗时: {load_time:.2f}秒")
+            logger.info(f"[{stats.request_id}] model loaded successfully, cost: {load_time:.2f}s")
             return True
             
         except Exception as e:
-            logger.error(f"模型加载失败: {str(e)}")
+            logger.error(f"model loading failed: {str(e)}")
             return False
     
     def get_model(self) -> Optional[SenseVoiceSmall]:
@@ -96,11 +96,11 @@ class ModelManager:
             转录结果列表
         """
         if not self.is_loaded():
-            logger.error("模型未加载，无法进行转录")
+            logger.error("model not loaded, cannot transcribe")
             return None
         
         if stats:
-            logger.info(f"[{stats.request_id}] 开始转录，音频数量: {len(audio_paths)}, 语言: {language}, 使用ITN: {use_itn}")
+            logger.info(f"[{stats.request_id}] transcribing, audio count: {len(audio_paths)}, language: {language}, use ITN: {use_itn}")
             
         # 进行推理
         try:
@@ -111,15 +111,15 @@ class ModelManager:
             if stats:
                 stats.record_step("模型推理")
                 avg_time = inference_time / len(audio_paths) if audio_paths else 0
-                logger.info(f"[{stats.request_id}] 转录完成，耗时: {inference_time:.4f}秒，平均每文件: {avg_time:.4f}秒")
+                logger.info(f"[{stats.request_id}] transcribed successfully, cost: {inference_time:.4f}s, avg per file: {avg_time:.4f}s")
             
             return results
             
         except Exception as e:
             if stats:
-                logger.error(f"[{stats.request_id}] 转录失败: {str(e)}")
+                logger.error(f"[{stats.request_id}] transcription failed: {str(e)}")
             else:
-                logger.error(f"转录失败: {str(e)}")
+                logger.error(f"transcription failed: {str(e)}")
             return None
 
 # 创建全局模型管理器实例

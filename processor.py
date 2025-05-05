@@ -56,7 +56,7 @@ def cleanup_temp_files(file_paths: List[str]) -> None:
             if os.path.exists(path):
                 os.remove(path)
         except Exception as e:
-            logger.warning(f"删除临时文件失败: {path}, 错误: {str(e)}")
+            logger.warning(f"Failed to delete temp file: {path}, error: {str(e)}")
 
 def decode_base64_audio(base64_data: str, stats: TimeStats = None) -> Optional[bytes]:
     """
@@ -78,7 +78,7 @@ def decode_base64_audio(base64_data: str, stats: TimeStats = None) -> Optional[b
         if stats:
             logger.error(f"[{stats.request_id}] Base64解码失败: {str(e)}")
         else:
-            logger.error(f"Base64解码失败: {str(e)}")
+            logger.error(f"Base64 decoding failed: {str(e)}")
         return None
 
 def extract_tags(text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:

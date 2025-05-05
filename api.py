@@ -64,7 +64,7 @@ async def add_process_time_header(request: Request, call_next):
     response = await call_next(request)
     process_time = start_time.total_time()
     response.headers["X-Process-Time"] = str(process_time)
-    logger.info(f"请求 {request.method} {request.url.path} 处理耗时: {process_time:.4f}秒")
+    logger.info(f"request {request.method} {request.url.path} cost: {process_time:.4f}s")
     return response
 
 @app.on_event("startup")
@@ -130,7 +130,7 @@ async def recognize_audio(
                 req_data = {"audio_base64": request_data}
             
             if "audio_base64" not in req_data:
-                logger.error(f"[{stats.request_id}] 请求缺少audio_base64字段")
+                logger.error(f"[{stats.request_id}] request missing audio_base64 field")
                 return JSONResponse(
                     status_code=400,
                     content={
@@ -162,10 +162,10 @@ async def recognize_audio(
             # 保存到临时文件
             audio_path = processor.save_temp_audio(audio_data)
             file_size = len(audio_data)
-            logger.info(f"[{stats.request_id}] 接收到Base64音频数据, 大小: {file_size/1024:.2f}KB")
+            logger.info(f"[{stats.request_id}] received base64 audio data, size: {file_size/1024:.2f}KB")
         
         else:
-            logger.error(f"[{stats.request_id}] 未提供音频数据")
+            logger.error(f"[{stats.request_id}] no audio data provided")
             return JSONResponse(
                 status_code=400,
                 content={
@@ -191,7 +191,7 @@ async def recognize_audio(
         return result
             
     except Exception as e:
-        logger.error(f"[{stats.request_id}] 处理异常: {str(e)}")
+        logger.error(f"[{stats.request_id}] process exception: {str(e)}")
         
         # 尝试清理临时文件
         if 'audio_path' in locals() and audio_path:
@@ -224,7 +224,7 @@ async def turn_audio_to_text(
     
     # 检查模型状态
     if not model_manager.is_loaded():
-        logger.error(f"[{stats.request_id}] 模型未加载成功")
+        logger.error(f"[{stats.request_id}] model not loaded")
         return JSONResponse(
             status_code=500,
             content={
@@ -240,7 +240,7 @@ async def turn_audio_to_text(
         audio_paths = []
         file_sizes = []
         
-        logger.info(f"[{stats.request_id}] 接收到批量处理请求，文件数: {len(files)}")
+        logger.info(f"[{stats.request_id}] received batch processing request, file count: {len(files)}")
         
         # 处理上传的文件
         for file in files:
@@ -250,7 +250,7 @@ async def turn_audio_to_text(
             audio_paths.append(audio_path)
         
         stats.record_step("文件上传")
-        logger.info(f"[{stats.request_id}] 所有文件上传完成，总大小: {sum(file_sizes)/1024:.2f}KB")
+        logger.info(f"[{stats.request_id}] all files uploaded, total size: {sum(file_sizes)/1024:.2f}KB")
         
         # 处理键值
         if keys == "":
@@ -274,7 +274,7 @@ async def turn_audio_to_text(
         return result
             
     except Exception as e:
-        logger.error(f"[{stats.request_id}] 处理异常: {str(e)}")
+        logger.error(f"[{stats.request_id}] process exception: {str(e)}")
         
         # 尝试清理临时文件
         if 'audio_paths' in locals():

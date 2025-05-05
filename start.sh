@@ -25,7 +25,7 @@ LOG_FORMAT=${SENSEVOICE_LOG_FORMAT:-"%(asctime)s - %(name)s - %(levelname)s - %(
 LOG_FILE=${SENSEVOICE_LOG_FILE:-""}
 
 # 设置临时目录
-TEMP_DIR=${SENSEVOICE_TEMP_DIR:-"/tmp"}
+TEMP_DIR=${SENSEVOICE_TEMP_DIR:-"/var/log/sensevoice"}
 
 # 显示配置信息
 echo "启动SenseVoice API服务..."

@@ -1,0 +1,66 @@
+[Unit]
+Description=SenseVoice 语音识别服务
+After=network.target
+Requires=network-online.target
+
+[Service]
+User=root
+Group=root
+
+# 工作目录
+WorkingDirectory=/usr/local/sensevoice
+
+# 日志配置
+StandardOutput=append:/var/log/sensevoice/service.log
+StandardError=append:/var/log/sensevoice/service.log
+
+# 创建需要的目录
+ExecStartPre=/bin/mkdir -p /var/log/sensevoice
+ExecStartPre=/bin/mkdir -p /var/run/sensevoice
+
+# 环境变量配置（可以通过环境变量文件扩展）
+# 如果需要自定义环境变量，可以创建 /etc/sensevoice/env.conf 文件
+# EnvironmentFile=-/etc/sensevoice/env.conf
+Environment="SENSEVOICE_MODEL_DIR=iic/SenseVoiceSmall"
+Environment="SENSEVOICE_GPU_DEVICE=0"
+Environment="SENSEVOICE_HOST=0.0.0.0"
+Environment="SENSEVOICE_PORT=8000"
+Environment="SENSEVOICE_BATCH_SIZE=1"
+Environment="SENSEVOICE_LOG_LEVEL=INFO"
+Environment="SENSEVOICE_TEMP_DIR=/var/log/sensevoice"
+Environment="CUDA_VISIBLE_DEVICES=5"
+
+# 直接启动Python服务
+# 可根据需要使用Gunicorn或其他WSGI服务器
+ExecStart=/usr/bin/python3 main.py
+
+# 自动重启设置
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=86400    # 24小时内
+StartLimitBurst=5              # 最多重启5次
+
+# 资源限制
+TimeoutStartSec=300
+TimeoutStopSec=30
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# 安全设置
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+# 设置优先级
+Nice=-10
+
+# 健康检查（如果服务提供健康检查接口）
+# ExecStartPost=/bin/sh -c 'sleep 5 && curl -f http://localhost:8000/ || exit 1'
+
+# GPU设备权限（取消注释以启用，根据实际情况配置）
+# DeviceAllow=/dev/nvidia0 rw
+# DeviceAllow=/dev/nvidiactl rw
+# DeviceAllow=/dev/nvidia-uvm rw
+
+[Install]
+WantedBy=multi-user.target 
