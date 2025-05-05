@@ -2,55 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-SenseVoice Small模型ONNX部署API服务
+SenseVoice API 接口模块
+实现API路由和处理逻辑
 """
 
 import os
-import time
 import json
-import base64
-import logging
-import re
 from typing import Optional, List, Dict, Any, Union, Annotated
-from io import BytesIO
 
-import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
-import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# 导入SenseVoice Small模型
-from funasr_onnx import SenseVoiceSmall
-from funasr_onnx.utils.postprocess_utils import rich_transcription_postprocess
-
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('sensevoice-api')
-
-# 创建FastAPI应用
-app = FastAPI(
-    title="SenseVoice API",
-    description="SenseVoice Small模型ONNX部署API服务",
-    version="1.0.0"
-)
-
-# 全局变量
-MODEL_DIR = os.environ.get("SENSEVOICE_MODEL_DIR", "iic/SenseVoiceSmall")
-GPU_DEVICE = os.environ.get("SENSEVOICE_GPU_DEVICE", "0")  # 指定GPU设备号
-BATCH_SIZE = int(os.environ.get("SENSEVOICE_BATCH_SIZE", "1"))
-
-# 设置CUDA设备
-os.environ["CUDA_VISIBLE_DEVICES"] = GPU_DEVICE
-
-# 用于移除标签的正则表达式
-regex = r"<\|.*?\|>"
-
-# 模型实例
-model = None
+import config
+from logger import logger
+from stats import TimeStats
+from model_manager import model_manager
+import processor
 
 # 请求模型
 class RecognitionRequest(BaseModel):
@@ -67,20 +36,44 @@ class RecognitionResponse(BaseModel):
     emotion: Optional[str] = None
     event: Optional[str] = None
     time_cost: float
+    detail_time: Optional[Dict[str, float]] = None  # 添加详细时间统计字段
+
+# 创建FastAPI应用
+app = FastAPI(
+    title="SenseVoice API",
+    description="SenseVoice Small模型ONNX部署API服务",
+    version="1.0.0"
+)
+
+# 添加CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源，生产环境中应该限制
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 添加请求耗时中间件
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    """
+    记录每个请求的处理时间，并在响应头中返回
+    """
+    start_time = TimeStats()
+    response = await call_next(request)
+    process_time = start_time.total_time()
+    response.headers["X-Process-Time"] = str(process_time)
+    logger.info(f"请求 {request.method} {request.url.path} 处理耗时: {process_time:.4f}秒")
+    return response
 
 @app.on_event("startup")
 async def startup_event():
     """
     服务启动时加载模型
     """
-    global model
-    try:
-        logger.info(f"正在加载SenseVoice Small模型，模型目录: {MODEL_DIR}, 使用GPU: {GPU_DEVICE}")
-        model = SenseVoiceSmall(MODEL_DIR, batch_size=BATCH_SIZE, quantize=True)
-        logger.info("模型加载成功")
-    except Exception as e:
-        logger.error(f"模型加载失败: {str(e)}")
-        raise e
+    config.print_config()
+    model_manager.load_model()
 
 @app.get("/")
 async def root():
@@ -102,150 +95,115 @@ async def recognize_audio(
     接受音频文件上传或base64编码的音频数据
     返回识别结果、语言类型、情绪和事件类型
     """
-    global model
+    # 初始化时间统计
+    stats = TimeStats()
     
-    start_time = time.time()
-    
-    if model is None:
+    # 检查模型状态
+    if not model_manager.is_loaded():
+        logger.error(f"[{stats.request_id}] 模型未加载成功")
         return JSONResponse(
             status_code=500,
-            content={"success": False, "message": "模型未加载成功", "time_cost": time.time() - start_time}
+            content={
+                "success": False, 
+                "message": "模型未加载成功", 
+                "time_cost": stats.total_time()
+            }
         )
     
     try:
-        # 处理输入数据
+        # 处理音频文件
+        audio_path = None
+        
         if audio_file is not None:
-            # 保存上传的文件到临时目录
-            temp_file = f"/tmp/sensevoice_{int(time.time())}_{audio_file.filename}"
-            with open(temp_file, "wb") as f:
-                f.write(await audio_file.read())
-            
-            audio_path = temp_file
+            # 从上传文件获取音频
+            content = await audio_file.read()
+            audio_path = processor.save_temp_audio(content, audio_file.filename)
+            file_size = len(content)
+            stats.record_step("文件上传")
+            logger.info(f"[{stats.request_id}] 接收到音频文件: {audio_file.filename}, 大小: {file_size/1024:.2f}KB")
+        
         elif request_data is not None:
-            # 解析JSON请求
+            # 从请求数据获取base64编码的音频
             try:
                 req_data = json.loads(request_data)
             except json.JSONDecodeError:
                 req_data = {"audio_base64": request_data}
             
             if "audio_base64" not in req_data:
+                logger.error(f"[{stats.request_id}] 请求缺少audio_base64字段")
                 return JSONResponse(
                     status_code=400,
                     content={
                         "success": False, 
                         "message": "缺少audio_base64字段", 
-                        "time_cost": time.time() - start_time
+                        "time_cost": stats.total_time(),
+                        "detail_time": stats.get_stats()
                     }
                 )
             
-            # 将base64解码为音频文件
+            # 从请求数据中获取参数
             audio_base64 = req_data.get("audio_base64")
             language = req_data.get("language", language)
             use_itn = req_data.get("use_itn", use_itn)
             
-            try:
-                audio_data = base64.b64decode(audio_base64)
-            except Exception as e:
+            # 解码base64数据
+            audio_data = processor.decode_base64_audio(audio_base64, stats)
+            if audio_data is None:
                 return JSONResponse(
                     status_code=400,
                     content={
                         "success": False, 
-                        "message": f"Base64解码失败: {str(e)}", 
-                        "time_cost": time.time() - start_time
+                        "message": "Base64解码失败", 
+                        "time_cost": stats.total_time(),
+                        "detail_time": stats.get_stats()
                     }
                 )
                 
             # 保存到临时文件
-            temp_file = f"/tmp/sensevoice_{int(time.time())}.wav"
-            with open(temp_file, "wb") as f:
-                f.write(audio_data)
-                
-            audio_path = temp_file
+            audio_path = processor.save_temp_audio(audio_data)
+            file_size = len(audio_data)
+            logger.info(f"[{stats.request_id}] 接收到Base64音频数据, 大小: {file_size/1024:.2f}KB")
+        
         else:
+            logger.error(f"[{stats.request_id}] 未提供音频数据")
             return JSONResponse(
                 status_code=400,
                 content={
                     "success": False, 
                     "message": "请提供音频文件或base64编码的音频数据", 
-                    "time_cost": time.time() - start_time
+                    "time_cost": stats.total_time(),
+                    "detail_time": stats.get_stats()
                 }
             )
         
-        # 执行模型推理
-        logger.info(f"开始处理音频: {audio_path}, 语言: {language}, 使用ITN: {use_itn}")
+        stats.record_step("数据准备")
         
-        # 调用SenseVoice模型
-        result = model([audio_path], language=language, use_itn=use_itn)
+        # 处理音频
+        result = processor.process_single_audio(audio_path, language, use_itn, stats)
         
-        # 处理结果
-        if result and len(result) > 0:
-            # 应用后处理
-            processed_text = rich_transcription_postprocess(result[0])
-            
-            # 提取语言、情绪和事件信息
-            language_tag = None
-            emotion_tag = None
-            event_tag = None
-            
-            # 尝试从结果中提取标签
-            for tag in ["<|zh|>", "<|en|>", "<|yue|>", "<|ja|>", "<|ko|>"]:
-                if tag in result[0]:
-                    language_tag = tag
-                    break
-                    
-            for tag in ["<|HAPPY|>", "<|SAD|>", "<|ANGRY|>", "<|NEUTRAL|>", "<|FEARFUL|>", "<|DISGUSTED|>", "<|SURPRISED|>"]:
-                if tag in result[0]:
-                    emotion_tag = tag
-                    break
-                    
-            for tag in ["<|BGM|>", "<|Speech|>", "<|Applause|>", "<|Laughter|>", "<|Cry|>", "<|Sneeze|>", "<|Breath|>", "<|Cough|>"]:
-                if tag in result[0]:
-                    event_tag = tag
-                    break
-            
-            # 移除临时文件
-            try:
-                os.remove(audio_path)
-            except Exception as e:
-                logger.warning(f"删除临时文件失败: {str(e)}")
-            
-            time_cost = time.time() - start_time
-            logger.info(f"处理完成，耗时: {time_cost:.2f}秒")
-            
-            return {
-                "success": True,
-                "message": "识别成功",
-                "text": processed_text,
-                "language": language_tag.replace("<|", "").replace("|>", "") if language_tag else None,
-                "emotion": emotion_tag.replace("<|", "").replace("|>", "") if emotion_tag else None,
-                "event": event_tag.replace("<|", "").replace("|>", "") if event_tag else None,
-                "time_cost": time_cost
-            }
-        else:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "success": False, 
-                    "message": "模型处理失败，未返回结果", 
-                    "time_cost": time.time() - start_time
-                }
-            )
+        # 清理临时文件
+        processor.cleanup_temp_files([audio_path])
+        stats.record_step("清理和完成")
+        
+        # 记录完成日志
+        stats.log_stats(prefix="处理完成，")
+        
+        return result
             
     except Exception as e:
-        logger.error(f"处理异常: {str(e)}")
+        logger.error(f"[{stats.request_id}] 处理异常: {str(e)}")
+        
         # 尝试清理临时文件
-        try:
-            if 'temp_file' in locals() and os.path.exists(temp_file):
-                os.remove(temp_file)
-        except:
-            pass
+        if 'audio_path' in locals() and audio_path:
+            processor.cleanup_temp_files([audio_path])
             
         return JSONResponse(
             status_code=500,
             content={
                 "success": False, 
                 "message": f"处理失败: {str(e)}", 
-                "time_cost": time.time() - start_time
+                "time_cost": stats.total_time(),
+                "detail_time": stats.get_stats()
             }
         )
 
@@ -261,121 +219,88 @@ async def turn_audio_to_text(
     
     接受多个音频文件上传，返回识别结果（包含原始文本、清洗后文本和处理后文本）
     """
-    global model
+    # 初始化时间统计
+    stats = TimeStats(prefix="batch")
     
-    start_time = time.time()
-    
-    if model is None:
+    # 检查模型状态
+    if not model_manager.is_loaded():
+        logger.error(f"[{stats.request_id}] 模型未加载成功")
         return JSONResponse(
             status_code=500,
-            content={"result": [], "message": "模型未加载成功", "time_cost": time.time() - start_time}
+            content={
+                "result": [], 
+                "message": "模型未加载成功", 
+                "time_cost": stats.total_time(),
+                "detail_time": stats.get_stats()
+            }
         )
     
     try:
         # 处理输入数据
         audio_paths = []
+        file_sizes = []
+        
+        logger.info(f"[{stats.request_id}] 接收到批量处理请求，文件数: {len(files)}")
+        
+        # 处理上传的文件
         for file in files:
-            # 保存上传的文件到临时目录
-            temp_file = f"/tmp/sensevoice_{int(time.time())}_{file.filename}"
             content = await file.read()
-            with open(temp_file, "wb") as f:
-                f.write(content)
-            audio_paths.append(temp_file)
+            file_sizes.append(len(content))
+            audio_path = processor.save_temp_audio(content, file.filename)
+            audio_paths.append(audio_path)
+        
+        stats.record_step("文件上传")
+        logger.info(f"[{stats.request_id}] 所有文件上传完成，总大小: {sum(file_sizes)/1024:.2f}KB")
         
         # 处理键值
         if keys == "":
-            key_list = ["wav_file_tmp_name"]
+            key_list = [f"file_{i}" for i in range(len(files))]
         else:
             key_list = keys.split(",")
+            # 如果键名不足，自动补充
+            while len(key_list) < len(files):
+                key_list.append(f"file_{len(key_list)}")
         
-        # 检查语言设置
-        if lang == "":
-            lang = "auto"
+        # 批量处理音频
+        result = processor.process_multiple_audio(audio_paths, key_list, lang, use_itn, stats)
         
-        # 执行模型推理
-        logger.info(f"开始处理音频: {audio_paths}, 语言: {lang}, 使用ITN: {use_itn}")
+        # 清理临时文件
+        processor.cleanup_temp_files(audio_paths)
+        stats.record_step("清理和完成")
         
-        # 调用SenseVoice模型
-        results = model(audio_paths, language=lang, use_itn=use_itn)
+        # 记录完成日志
+        stats.log_stats(prefix="批量处理完成，")
         
-        # 处理结果
-        if results and len(results) > 0:
-            # 格式化输出结果
-            output_results = []
-            
-            for i, result in enumerate(results):
-                # 获取当前文件对应的key
-                key = key_list[i] if i < len(key_list) else f"unknown_{i}"
-                
-                # 提取标签信息
-                language_tag = None
-                emotion_tag = None
-                event_tag = None
-                
-                for tag in ["<|zh|>", "<|en|>", "<|yue|>", "<|ja|>", "<|ko|>"]:
-                    if tag in result:
-                        language_tag = tag.replace("<|", "").replace("|>", "")
-                        break
-                        
-                for tag in ["<|HAPPY|>", "<|SAD|>", "<|ANGRY|>", "<|NEUTRAL|>", "<|FEARFUL|>", "<|DISGUSTED|>", "<|SURPRISED|>"]:
-                    if tag in result:
-                        emotion_tag = tag.replace("<|", "").replace("|>", "")
-                        break
-                        
-                for tag in ["<|BGM|>", "<|Speech|>", "<|Applause|>", "<|Laughter|>", "<|Cry|>", "<|Sneeze|>", "<|Breath|>", "<|Cough|>"]:
-                    if tag in result:
-                        event_tag = tag.replace("<|", "").replace("|>", "")
-                        break
-                
-                # 生成不同处理级别的文本
-                raw_text = result
-                clean_text = re.sub(regex, "", result, 0, re.MULTILINE)
-                processed_text = rich_transcription_postprocess(result)
-                
-                # 添加到结果列表
-                output_results.append({
-                    "key": key,
-                    "raw_text": raw_text,
-                    "clean_text": clean_text,
-                    "text": processed_text,
-                    "language": language_tag,
-                    "emotion": emotion_tag,
-                    "event": event_tag
-                })
-            
-            # 清理临时文件
-            for path in audio_paths:
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    logger.warning(f"删除临时文件失败: {str(e)}")
-            
-            time_cost = time.time() - start_time
-            logger.info(f"处理完成，耗时: {time_cost:.2f}秒")
-            
-            return {"result": output_results}
-        else:
-            return {"result": []}
+        return result
             
     except Exception as e:
-        logger.error(f"处理异常: {str(e)}")
+        logger.error(f"[{stats.request_id}] 处理异常: {str(e)}")
+        
         # 尝试清理临时文件
-        try:
-            for path in audio_paths:
-                if os.path.exists(path):
-                    os.remove(path)
-        except:
-            pass
+        if 'audio_paths' in locals():
+            processor.cleanup_temp_files(audio_paths)
             
         return JSONResponse(
             status_code=500,
-            content={"result": [], "message": f"处理失败: {str(e)}"}
+            content={
+                "result": [], 
+                "message": f"处理失败: {str(e)}", 
+                "time_cost": stats.total_time(),
+                "detail_time": stats.get_stats()
+            }
         )
 
 if __name__ == "__main__":
     # 服务启动配置
     HOST = os.environ.get("SENSEVOICE_HOST", "0.0.0.0")
     PORT = int(os.environ.get("SENSEVOICE_PORT", "8000"))
+    
+    # 启动信息
+    print(f"================================")
+    print(f"SenseVoice API 服务启动")
+    print(f"主机: {HOST}")
+    print(f"端口: {PORT}")
+    print(f"================================")
     
     # 启动服务
     uvicorn.run(app, host=HOST, port=PORT)

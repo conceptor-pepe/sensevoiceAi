@@ -170,6 +170,15 @@ curl -X POST "http://localhost:8000/api/v1/asr" \
   -w "总耗时: %{time_total}秒\n" \
   -s
 
+# 上传多个音频文件
+curl -X POST "http://localhost:8000/api/v1/asr" \
+  -F "files=@en.mp3" \
+  -F "files=@zh.mp3" \
+  -F "keys=test1,test2" \
+  -F "lang=en" \
+  -w "总耗时: %{time_total}秒\n" \
+  -s
+
 # Base64编码请求
 curl -X POST http://localhost:8000/recognize \
   -F 'request_data={"audio_base64":"BASE64_ENCODED_AUDIO_DATA", "language":"auto", "use_itn":true}'
