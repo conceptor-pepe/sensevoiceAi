@@ -157,9 +157,18 @@ with open("audio.wav", "rb") as f:
 ```bash
 # 上传音频文件
 curl -X POST http://localhost:8000/recognize \
-  -F "audio_file=@audio.wav" \
+  -F "audio_file=@en.mp3" \
   -F "language=auto" \
-  -F "use_itn=true"
+  -F "use_itn=true" \
+  -w "总耗时: %{time_total}秒\n" \
+  -s
+
+curl -X POST "http://localhost:8000/api/v1/asr" \
+  -F "files=@en.mp3" \
+  -F "keys=test" \
+  -F "lang=en" \
+  -w "总耗时: %{time_total}秒\n" \
+  -s
 
 # Base64编码请求
 curl -X POST http://localhost:8000/recognize \
