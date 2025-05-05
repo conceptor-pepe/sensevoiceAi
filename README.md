@@ -10,6 +10,7 @@
 - **多语言支持**：自动识别并支持中文(zh)、英文(en)、粤语(yue)、日语(ja)、韩语(ko)
 - **情感识别**：自动检测语音中表达的情绪，包括快乐(HAPPY)、悲伤(SAD)、愤怒(ANGRY)、中性(NEUTRAL)、恐惧(FEARFUL)、厌恶(DISGUSTED)和惊讶(SURPRISED)
 - **事件检测**：识别语音中的背景音乐(BGM)、演讲(Speech)、掌声(Applause)、笑声(Laughter)、哭声(Cry)、打喷嚏(Sneeze)、呼吸(Breath)和咳嗽(Cough)等事件
+- **流式识别**：支持HTTP流式响应和WebSocket实时交互，适用于实时语音识别场景
 
 ### 1.2 技术特点
 
@@ -19,6 +20,7 @@
 - **灵活输入**：支持多种音频输入方式（文件上传和Base64编码）
 - **高级文本处理**：支持反向文本归一化(ITN)，提升数字、日期等特殊内容的识别质量
 - **可靠性设计**：内置进程管理和自动重启功能，保障服务可靠运行
+- **流式处理**：支持音频文件分块流式处理和实时WebSocket流式识别，降低识别延迟
 
 ## 2. 架构设计
 
@@ -78,7 +80,6 @@ SenseVoice API服务采用模块化设计，主要由以下组件构成：
 
 - **支持更多语言模型**：扩展语言支持范围
 - **增强情感识别**：提升情感识别准确度和细粒度
-- **实时转录API**：支持流式音频处理，实现实时转录
 - **自定义词典**：支持领域定制词汇，提升特定场景识别质量
 - **多模型加载**：支持同时加载多个模型，根据场景自动选择最适合的模型
 
@@ -204,6 +205,8 @@ SENSEVOICE_GPU_DEVICE=1 SENSEVOICE_PORT=8080 ./start.sh
 | SENSEVOICE_LOG_LEVEL | 日志级别 | INFO |
 | SENSEVOICE_LOG_FILE | 日志文件路径 | (默认输出到控制台) |
 | SENSEVOICE_TEMP_DIR | 临时文件目录 | /tmp |
+| SENSEVOICE_CHUNK_SIZE_SEC | 流式处理默认分块大小（秒） | 3 |
+| SENSEVOICE_MAX_CLIENTS | WebSocket最大并发连接数 | 10 |
 
 ### 4.4 API接口
 
@@ -314,6 +317,114 @@ POST /api/v1/asr
 }
 ```
 
+#### 4.4.4 流式语音识别
+
+SenseVoice API 提供三种流式语音识别方式：
+
+1. **HTTP流式响应**：适用于离线音频文件的流式处理
+2. **WebSocket实时交互**：适用于实时语音流（如麦克风输入）
+3. **兼容GitHub SenseVoice API的流式接口**
+
+##### HTTP流式识别接口
+
+基本流式接口 `/recognize/stream`：
+
+```
+POST /recognize/stream
+```
+
+请求参数：
+- audio_file: 音频文件（表单上传）
+- language: 语言代码（默认"auto"）
+- use_itn: 是否使用ITN（默认true）
+- chunk_size_sec: 分块大小（秒）（默认3）
+
+或者使用Base64编码的请求：
+- request_data: JSON字符串，包含以下字段：
+  - audio_base64: Base64编码的音频数据
+  - language: 语言代码（默认"auto"）
+  - use_itn: 是否使用ITN（默认true）
+  - chunk_size_sec: 分块大小（秒）（默认3）
+
+兼容接口 `/api/v1/asr/stream`：
+
+```
+POST /api/v1/asr/stream
+```
+
+请求参数：
+- files: 音频文件
+- keys: 音频文件键名
+- lang: 语言代码（默认"auto"）
+- use_itn: 是否使用ITN（默认false）
+- chunk_size_sec: 分块大小（秒）（默认3）
+
+响应格式：返回的是新行分隔的JSON（NDJSON）格式，每行包含一个JSON对象，表示一个处理块的结果：
+
+```json
+{"success":true,"message":"部分识别结果","text":"你好","accumulated_text":"你好","language":"zh","emotion":"NEUTRAL","event":"Speech","is_final":false,"chunk_id":1,"time_cost":0.345}
+{"success":true,"message":"部分识别结果","text":"世界","accumulated_text":"你好 世界","language":"zh","emotion":"NEUTRAL","event":"Speech","is_final":false,"chunk_id":2,"time_cost":0.326}
+{"success":true,"message":"识别完成","text":"你好 世界","accumulated_text":"你好 世界","language":"zh","emotion":"NEUTRAL","event":"Speech","is_final":true,"chunk_id":2,"time_cost":0.721,"detail_time":{"流式处理开始":0.001,"处理第1块":0.345,"处理第2块":0.326,"流式处理完成":0.049}}
+```
+
+##### WebSocket流式识别接口
+
+标准WebSocket接口 `/ws/recognize`：
+
+1. 连接建立：
+```javascript
+const socket = new WebSocket('ws://localhost:8000/ws/recognize');
+```
+
+2. 认证和初始化：
+```javascript
+const config = {
+    language: "auto",
+    use_itn: true
+};
+socket.send(JSON.stringify(config));
+```
+
+3. 发送音频数据：
+```javascript
+// 发送音频块
+socket.send(audioChunk);
+
+// 发送空数据表示音频结束
+socket.send(new ArrayBuffer(0));
+```
+
+4. 接收识别结果：
+```javascript
+socket.onmessage = function(event) {
+    const result = JSON.parse(event.data);
+    
+    if (result.is_final) {
+        // 最终结果处理
+        console.log("最终识别结果:", result.text);
+    } else {
+        // 部分结果处理
+        console.log("当前识别:", result.text);
+    }
+};
+```
+
+兼容接口 `/api/v1/ws/asr`：
+
+与标准WebSocket接口类似，但配置和响应格式略有不同：
+
+```javascript
+const socket = new WebSocket('ws://localhost:8000/api/v1/ws/asr');
+
+// 发送配置
+const config = {
+    lang: "auto",
+    use_itn: false,
+    key: "my_audio"
+};
+socket.send(JSON.stringify(config));
+```
+
 ### 4.5 使用示例
 
 #### Python示例
@@ -363,6 +474,61 @@ with open("audio1.wav", "rb") as f1, open("audio2.wav", "rb") as f2:
         }
     )
     print(response.json())
+
+# 方法4：HTTP流式处理
+with open("audio.wav", "rb") as f:
+    # 使用stream=True接收流式响应
+    response = requests.post(
+        "http://localhost:8000/recognize/stream",
+        files={"audio_file": f},
+        data={"language": "auto", "use_itn": "true", "chunk_size_sec": "3"},
+        stream=True
+    )
+    
+    # 处理流式响应
+    for line in response.iter_lines():
+        if line:
+            result = json.loads(line.decode('utf-8'))
+            print(f"当前文本: {result.get('text')}")
+            print(f"累积文本: {result.get('accumulated_text')}")
+            print(f"是否最终结果: {result.get('is_final', False)}")
+            
+# 方法5：WebSocket流式处理
+import asyncio
+import websockets
+
+async def websocket_asr():
+    # 连接到WebSocket服务器
+    async with websockets.connect("ws://localhost:8000/ws/recognize") as ws:
+        # 发送配置信息
+        await ws.send(json.dumps({
+            "language": "auto",
+            "use_itn": True
+        }))
+        
+        # 读取并发送音频数据
+        with open("audio.wav", "rb") as f:
+            while True:
+                chunk = f.read(3200)  # 读取约0.2秒的音频数据（16kHz采样率）
+                if not chunk:
+                    break
+                    
+                # 发送音频块
+                await ws.send(chunk)
+                
+                # 接收并处理结果
+                result = json.loads(await ws.recv())
+                print(f"当前识别: {result.get('text')}")
+                
+            # 发送空数据表示结束
+            await ws.send(b"")
+            
+            # 接收最终结果
+            final_result = json.loads(await ws.recv())
+            print(f"最终识别结果: {final_result.get('text')}")
+
+# 运行WebSocket示例
+# asyncio.run(websocket_asr())
 ```
 
 #### curl示例
@@ -381,6 +547,15 @@ curl -X POST "http://localhost:8000/api/v1/asr" \
   -F "keys=test1,test2" \
   -F "lang=auto" \
   -w "总耗时: %{time_total}秒\n"
+
+# HTTP流式处理
+curl -X POST "http://localhost:8000/recognize/stream" \
+  -F "audio_file=@audio.wav" \
+  -F "language=auto" \
+  -F "use_itn=true" \
+  -F "chunk_size_sec=3"
+
+# WebSocket流式处理需要使用WebSocket客户端，如websocket-client库或专门的WebSocket测试工具
 ```
 
 ### 4.6 错误处理

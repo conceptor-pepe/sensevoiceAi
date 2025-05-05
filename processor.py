@@ -10,7 +10,8 @@ import os
 import re
 import time
 import base64
-from typing import List, Dict, Any, Optional, Tuple
+import json
+from typing import List, Dict, Any, Optional, Tuple, Generator, AsyncGenerator
 
 import config
 from logger import logger
@@ -235,4 +236,59 @@ def process_multiple_audio(audio_paths: List[str], key_list: List[str], language
     if stats:
         response["detail_time"] = stats.get_stats()
         
-    return response 
+    return response
+
+async def process_stream_audio(audio_path: str, language: str = "auto", use_itn: bool = True, 
+                         chunk_size_sec: int = 3, stats: TimeStats = None) -> AsyncGenerator[Dict[str, Any], None]:
+    """
+    流式处理音频文件
+    
+    参数:
+        audio_path: 音频文件路径
+        language: 语言代码
+        use_itn: 是否使用反向文本归一化
+        chunk_size_sec: 每个块的处理时长（秒）
+        stats: 时间统计对象
+        
+    返回:
+        异步生成器，生成每个片段的识别结果
+    """
+    if not model_manager.is_loaded():
+        error_result = {
+            "success": False,
+            "message": "模型未加载",
+            "is_final": True,
+            "time_cost": stats.total_time() if stats else 0
+        }
+        yield json.dumps(error_result)
+        return
+    
+    if stats:
+        logger.info(f"[{stats.request_id}] 开始流式处理, 文件: {audio_path}, 语言: {language}, use_itn: {use_itn}")
+        
+    try:
+        # 调用模型管理器的流式转录函数
+        stream_results = model_manager.transcribe_stream(audio_path, language, use_itn, chunk_size_sec, stats)
+        
+        # 逐个处理结果块
+        for result in stream_results:
+            # 转换为JSON格式返回
+            result_json = json.dumps(result)
+            yield result_json
+            
+            # 如果是最终结果，记录完成信息
+            if result.get("is_final", False) and stats:
+                stats.log_stats(prefix="流式处理完成，")
+                
+    except Exception as e:
+        error_msg = f"流式处理异常: {str(e)}"
+        logger.error(f"[{stats.request_id if stats else 'stream'}] {error_msg}")
+        
+        # 返回错误信息
+        error_result = {
+            "success": False,
+            "message": error_msg,
+            "is_final": True,
+            "time_cost": stats.total_time() if stats else 0
+        }
+        yield json.dumps(error_result) 
