@@ -3,8 +3,9 @@
 # 设置默认参数
 MODEL_DIR=${SENSEVOICE_MODEL_DIR:-"iic/SenseVoiceSmall"}
 
-# 设置GPU设备
-GPU_DEVICE=${SENSEVOICE_GPU_DEVICE:-"5"}
+# 设置GPU设备 - 显式设置为5而不是使用环境变量
+GPU_DEVICE="5"
+echo "强制设置GPU_DEVICE=$GPU_DEVICE"
 
 # 设置主机地址
 HOST=${SENSEVOICE_HOST:-"0.0.0.0"}
@@ -42,7 +43,11 @@ if [ -n "$LOG_FILE" ]; then
     mkdir -p "$LOG_DIR"
 fi
 
-# 设置环境变量
+# 检查NVIDIA驱动和可用GPU
+echo "检查NVIDIA驱动状态:"
+nvidia-smi || echo "无法执行nvidia-smi，请检查GPU驱动"
+
+# 设置环境变量 - 确保正确设置
 export SENSEVOICE_MODEL_DIR=$MODEL_DIR
 export SENSEVOICE_GPU_DEVICE=$GPU_DEVICE
 export SENSEVOICE_HOST=$HOST
@@ -52,11 +57,16 @@ export SENSEVOICE_LOG_LEVEL=$LOG_LEVEL
 export SENSEVOICE_LOG_FORMAT="$LOG_FORMAT"
 export SENSEVOICE_LOG_FILE="$LOG_FILE"
 export SENSEVOICE_TEMP_DIR="$TEMP_DIR"
+
+# 直接设置CUDA环境变量
 export CUDA_VISIBLE_DEVICES=$GPU_DEVICE
+echo "已设置环境变量: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "已设置环境变量: SENSEVOICE_GPU_DEVICE=$SENSEVOICE_GPU_DEVICE"
 
 # 记录启动时间戳
 START_TIME=$(date +"%Y-%m-%d %H:%M:%S")
 echo "服务启动时间: $START_TIME"
 
 # 启动服务
+echo "启动Python服务..."
 python main.py 

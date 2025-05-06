@@ -8,6 +8,7 @@ SenseVoice API 模型管理模块
 
 import os
 import time
+import subprocess
 import numpy as np
 from typing import Optional, Generator, List, Dict, Any, Tuple
 from collections import deque
@@ -38,13 +39,60 @@ class ModelManager:
     def __init__(self):
         """仅在首次创建实例时初始化"""
         if self._model is None:
-            # 设置CUDA设备
-            os.environ["CUDA_VISIBLE_DEVICES"] = config.GPU_DEVICE
+            # 记录当前环境变量
+            logger.info(f"初始化模型管理器: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '未设置')}")
+            logger.info(f"初始化模型管理器: SENSEVOICE_GPU_DEVICE={os.environ.get('SENSEVOICE_GPU_DEVICE', '未设置')}")
+            logger.info(f"初始化模型管理器: ORT_CUDA_DEVICE={os.environ.get('ORT_CUDA_DEVICE', '未设置')}")
+            
+            # 设置CUDA设备 - 确保这里使用的是字符串类型
+            gpu_device_id = config.GPU_DEVICE
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device_id
+            logger.info(f"已设置CUDA_VISIBLE_DEVICES={gpu_device_id}")
+            
+            # 额外的ONNX Runtime环境变量
+            os.environ["ORT_CUDA_DEVICE"] = gpu_device_id
+            logger.info(f"已设置ORT_CUDA_DEVICE={gpu_device_id}")
+            
+            # 检查GPU可用性
+            self._check_gpu_availability()
             
             # WebSocket流式处理相关属性
             self._ws_lock = Lock()
             self._sample_rate = 16000  # 默认采样率
             self._accumulated_results = {}  # 存储累积识别结果的字典
+    
+    def _check_gpu_availability(self):
+        """检查GPU可用性"""
+        try:
+            # 使用nvidia-smi检查GPU状态
+            result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode == 0:
+                logger.info(f"NVIDIA-SMI输出：\n{result.stdout.decode('utf-8')[:500]}...")
+            else:
+                logger.warning(f"无法获取GPU信息: {result.stderr.decode('utf-8')}")
+                
+            # 检查onnxruntime是否支持GPU
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            logger.info(f"ONNX Runtime可用Provider: {providers}")
+            
+            if 'CUDAExecutionProvider' in providers:
+                logger.info("ONNX Runtime支持CUDA")
+                # 获取GPU设备信息
+                gpu_device_id = int(config.GPU_DEVICE)
+                cuda_provider_options = {
+                    'device_id': gpu_device_id,
+                    'arena_extend_strategy': 'kNextPowerOfTwo',
+                    'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
+                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                    'do_copy_in_default_stream': True,
+                }
+                logger.info(f"CUDA提供程序选项: {cuda_provider_options}")
+                
+            else:
+                logger.warning("ONNX Runtime不支持CUDA，将使用CPU推理")
+        except Exception as e:
+            logger.error(f"检查GPU可用性时出错: {str(e)}")
     
     def load_model(self) -> bool:
         """
@@ -55,22 +103,89 @@ class ModelManager:
         """
         try:
             stats = TimeStats(prefix="model_load")
-            logger.info(f"[{stats.request_id}] loading SenseVoice Small model, model dir: {config.MODEL_DIR}, using GPU: {config.GPU_DEVICE}")
             
-            # 加载模型
-            self._model = SenseVoiceSmall(
-                config.MODEL_DIR, 
-                batch_size=config.BATCH_SIZE, 
-                quantize=True
-            )
+            # 再次确认CUDA设备设置
+            logger.info(f"[{stats.request_id}] 加载模型前环境变量: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '未设置')}")
+            logger.info(f"[{stats.request_id}] 加载模型前环境变量: ORT_CUDA_DEVICE={os.environ.get('ORT_CUDA_DEVICE', '未设置')}")
+            
+            # 强制设置CUDA设备 (确保这一步骤不会被跳过)
+            gpu_device_id = config.GPU_DEVICE
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device_id
+            logger.info(f"[{stats.request_id}] 已重新设置CUDA_VISIBLE_DEVICES={gpu_device_id}")
+            
+            # 同时设置ORT_CUDA_DEVICE环境变量
+            os.environ["ORT_CUDA_DEVICE"] = gpu_device_id
+            logger.info(f"[{stats.request_id}] 已重新设置ORT_CUDA_DEVICE={gpu_device_id}")
+            
+            # 记录模型加载信息
+            logger.info(f"[{stats.request_id}] 加载SenseVoice Small模型, 模型目录: {config.MODEL_DIR}, 指定GPU: {gpu_device_id}")
+            
+            # 获取ORT环境信息
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            logger.info(f"[{stats.request_id}] 加载模型时ONNX Runtime提供程序: {providers}")
+            
+            # 定义提供程序选项
+            provider_options = None
+            if 'CUDAExecutionProvider' in providers:
+                device_id = int(gpu_device_id)
+                provider_options = [{
+                    'device_id': device_id,
+                    'arena_extend_strategy': 'kNextPowerOfTwo',
+                    'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
+                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                    'do_copy_in_default_stream': True,
+                }]
+                logger.info(f"[{stats.request_id}] 设置CUDA提供程序选项: {provider_options}, 指定device_id={device_id}")
+                
+                # 明确设置提供程序顺序 - 确保CUDA优先
+                execution_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                logger.info(f"[{stats.request_id}] 明确设置提供程序顺序: {execution_providers}")
+            
+            # 加载模型，尝试明确指定Provider
+            try:
+                if 'CUDAExecutionProvider' in providers:
+                    self._model = SenseVoiceSmall(
+                        config.MODEL_DIR, 
+                        batch_size=config.BATCH_SIZE, 
+                        quantize=True,
+                        providers=execution_providers,
+                        provider_options=provider_options
+                    )
+                    logger.info(f"[{stats.request_id}] 使用CUDA提供程序加载模型")
+                else:
+                    self._model = SenseVoiceSmall(
+                        config.MODEL_DIR, 
+                        batch_size=config.BATCH_SIZE, 
+                        quantize=True
+                    )
+                    logger.info(f"[{stats.request_id}] 使用默认提供程序加载模型")
+            except TypeError as te:
+                # 如果SenseVoiceSmall不接受provider_options参数，使用默认构造
+                logger.warning(f"[{stats.request_id}] SenseVoiceSmall加载异常: {str(te)}")
+                logger.warning(f"[{stats.request_id}] SenseVoiceSmall不支持provider_options参数，使用默认加载方式")
+                self._model = SenseVoiceSmall(
+                    config.MODEL_DIR, 
+                    batch_size=config.BATCH_SIZE, 
+                    quantize=True
+                )
             
             # 记录加载时间
             load_time = stats.total_time()
-            logger.info(f"[{stats.request_id}] model loaded successfully, cost: {load_time:.2f}s")
+            logger.info(f"[{stats.request_id}] 模型加载成功，耗时: {load_time:.2f}秒")
+            
+            # 打印模型信息
+            try:
+                model_info = getattr(self._model, "get_model_info", lambda: "不支持获取模型信息")
+                if callable(model_info):
+                    logger.info(f"[{stats.request_id}] 模型信息: {model_info()}")
+            except Exception as e:
+                logger.warning(f"[{stats.request_id}] 无法获取模型信息: {str(e)}")
+            
             return True
             
         except Exception as e:
-            logger.error(f"model loading failed: {str(e)}")
+            logger.error(f"模型加载失败: {str(e)}")
             return False
     
     def get_model(self) -> Optional[SenseVoiceSmall]:
