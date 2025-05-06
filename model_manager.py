@@ -13,6 +13,7 @@ import numpy as np
 from typing import Optional, Generator, List, Dict, Any, Tuple
 from collections import deque
 from threading import Lock
+import torch
 
 import config
 from logger import logger
@@ -23,169 +24,209 @@ from funasr_onnx import SenseVoiceSmall
 
 class ModelManager:
     """
-    模型管理器类
-    负责模型的加载和提供访问接口
+    模型管理器类 - GPU优化版
     """
     
     _instance = None
     _model = None
     
     def __new__(cls):
-        """单例模式实现"""
         if cls._instance is None:
             cls._instance = super(ModelManager, cls).__new__(cls)
         return cls._instance
     
     def __init__(self):
-        """仅在首次创建实例时初始化"""
         if self._model is None:
-            # 记录当前环境变量
-            logger.info(f"初始化模型管理器: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '未设置')}")
-            logger.info(f"初始化模型管理器: SENSEVOICE_GPU_DEVICE={os.environ.get('SENSEVOICE_GPU_DEVICE', '未设置')}")
-            logger.info(f"初始化模型管理器: ORT_CUDA_DEVICE={os.environ.get('ORT_CUDA_DEVICE', '未设置')}")
+            # 强制设置GPU环境变量（立即生效）
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(config.GPU_DEVICE)
+            os.environ["ORT_CUDA_DEVICE"] = "0"  # 重要修改：设置为0，因为CUDA_VISIBLE_DEVICES已指定了实际设备
+            os.environ["OMP_NUM_THREADS"] = "1"  # 避免CPU线程竞争
             
-            # 设置CUDA设备 - 确保这里使用的是字符串类型
-            gpu_device_id = config.GPU_DEVICE
-            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device_id
-            logger.info(f"已设置CUDA_VISIBLE_DEVICES={gpu_device_id}")
+            logger.info(f"强制设置GPU环境: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
             
-            # 额外的ONNX Runtime环境变量
-            os.environ["ORT_CUDA_DEVICE"] = gpu_device_id
-            logger.info(f"已设置ORT_CUDA_DEVICE={gpu_device_id}")
-            
-            # 检查GPU可用性
-            self._check_gpu_availability()
-            
-            # WebSocket流式处理相关属性
+            # 初始化流式处理相关属性
             self._ws_lock = Lock()
-            self._sample_rate = 16000  # 默认采样率
-            self._accumulated_results = {}  # 存储累积识别结果的字典
-    
+            self._sample_rate = 16000
+            self._accumulated_results = {}
+            
+            # 立即检查GPU状态
+            self._check_gpu_availability()
+
     def _check_gpu_availability(self):
-        """检查GPU可用性"""
+        """增强版GPU检查"""
         try:
-            # 使用nvidia-smi检查GPU状态
-            result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # 1. 检查nvidia-smi
+            result = subprocess.run(
+                ['nvidia-smi', '-i', config.GPU_DEVICE, '--query-gpu=name,memory.total', '--format=csv'],
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE
+            )
             if result.returncode == 0:
-                logger.info(f"NVIDIA-SMI输出：\n{result.stdout.decode('utf-8')[:500]}...")
+                gpu_info = result.stdout.decode('utf-8').strip()
+                logger.info(f"GPU {config.GPU_DEVICE} 信息:\n{gpu_info}")
             else:
-                logger.warning(f"无法获取GPU信息: {result.stderr.decode('utf-8')}")
-                
-            # 检查onnxruntime是否支持GPU
+                logger.error(f"GPU检查失败: {result.stderr.decode('utf-8')}")
+
+            # 2. 检查ONNX Runtime GPU支持
             import onnxruntime as ort
             providers = ort.get_available_providers()
-            logger.info(f"ONNX Runtime可用Provider: {providers}")
+            logger.info(f"ONNX Runtime可用Providers: {providers}")
             
-            if 'CUDAExecutionProvider' in providers:
-                logger.info("ONNX Runtime支持CUDA")
-                # 获取GPU设备信息
-                gpu_device_id = int(config.GPU_DEVICE)
-                cuda_provider_options = {
-                    'device_id': gpu_device_id,
-                    'arena_extend_strategy': 'kNextPowerOfTwo',
-                    'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
-                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
-                    'do_copy_in_default_stream': True,
-                }
-                logger.info(f"CUDA提供程序选项: {cuda_provider_options}")
+            if 'CUDAExecutionProvider' not in providers:
+                raise RuntimeError("ONNX Runtime未检测到CUDA支持")
                 
+            # 3. 确认GPU可用性
+            # 不再尝试加载空模型，而是简单地检查环境变量和提供程序
+            cuda_device_id = int(config.GPU_DEVICE)
+            logger.info(f"GPU环境检查: 使用GPU设备ID {cuda_device_id}")
+            
+            # 强制设置GPU环境变量
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(config.GPU_DEVICE)
+            os.environ["ORT_CUDA_DEVICE"] = "0"  # 由于设置了CUDA_VISIBLE_DEVICES，在ONNX中使用0号设备
+            
+            # 验证环境变量
+            logger.info(f"已设置环境变量 CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
+            logger.info(f"已设置环境变量 ORT_CUDA_DEVICE={os.environ.get('ORT_CUDA_DEVICE')}")
+            
+            # 确认CUDA可用
+            if torch.cuda.is_available():
+                device_count = torch.cuda.device_count()
+                device_name = torch.cuda.get_device_name(0) if device_count > 0 else "未知"
+                logger.info(f"PyTorch检测到 {device_count} 个GPU设备，当前设备: {device_name}")
             else:
-                logger.warning("ONNX Runtime不支持CUDA，将使用CPU推理")
+                logger.warning("PyTorch未检测到可用的CUDA设备")
+            
+            logger.info("GPU检查完成，环境配置正确")
+            
         except Exception as e:
-            logger.error(f"检查GPU可用性时出错: {str(e)}")
-    
+            logger.error(f"GPU检查严重错误: {str(e)}")
+            raise
     def load_model(self) -> bool:
         """
-        加载模型
-        
-        返回:
-            bool: 加载是否成功
+        优化版模型加载函数
+        支持自动重试和错误恢复
         """
+        stats = TimeStats(prefix="model_load")
+        
         try:
-            stats = TimeStats(prefix="model_load")
-            
-            # 再次确认CUDA设备设置
-            logger.info(f"[{stats.request_id}] 加载模型前环境变量: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '未设置')}")
-            logger.info(f"[{stats.request_id}] 加载模型前环境变量: ORT_CUDA_DEVICE={os.environ.get('ORT_CUDA_DEVICE', '未设置')}")
-            
-            # 强制设置CUDA设备 (确保这一步骤不会被跳过)
-            gpu_device_id = config.GPU_DEVICE
-            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device_id
-            logger.info(f"[{stats.request_id}] 已重新设置CUDA_VISIBLE_DEVICES={gpu_device_id}")
-            
-            # 同时设置ORT_CUDA_DEVICE环境变量
-            os.environ["ORT_CUDA_DEVICE"] = gpu_device_id
-            logger.info(f"[{stats.request_id}] 已重新设置ORT_CUDA_DEVICE={gpu_device_id}")
-            
-            # 记录模型加载信息
-            logger.info(f"[{stats.request_id}] 加载SenseVoice Small模型, 模型目录: {config.MODEL_DIR}, 指定GPU: {gpu_device_id}")
-            
-            # 获取ORT环境信息
+            # 重新强制设置GPU环境变量
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(config.GPU_DEVICE)
+            os.environ["ORT_CUDA_DEVICE"] = "0"  # 重要：必须是0，因为CUDA_VISIBLE_DEVICES已经筛选了实际GPU
+            logger.info(f"[{stats.request_id}] 设置环境变量: CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}, ORT_CUDA_DEVICE={os.environ['ORT_CUDA_DEVICE']}")
+
+            # 确认ONNX Runtime的GPU支持
             import onnxruntime as ort
-            providers = ort.get_available_providers()
-            logger.info(f"[{stats.request_id}] 加载模型时ONNX Runtime提供程序: {providers}")
+            ort_providers = ort.get_available_providers()
+            if 'CUDAExecutionProvider' not in ort_providers:
+                logger.warning(f"[{stats.request_id}] ONNX Runtime不支持CUDA，将使用CPU推理")
             
-            # 定义提供程序选项
-            provider_options = None
-            if 'CUDAExecutionProvider' in providers:
-                device_id = int(gpu_device_id)
-                provider_options = [{
-                    'device_id': device_id,
+            logger.info(f"[{stats.request_id}] ONNX Runtime提供者: {ort_providers}")
+            
+            # 安全的GPU Provider配置
+            providers = [
+                ('CUDAExecutionProvider', {
+                    'device_id': 0,  # 必须为0，因为CUDA_VISIBLE_DEVICES已筛选
+                    'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB
                     'arena_extend_strategy': 'kNextPowerOfTwo',
-                    'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
-                    'cudnn_conv_algo_search': 'EXHAUSTIVE',
-                    'do_copy_in_default_stream': True,
-                }]
-                logger.info(f"[{stats.request_id}] 设置CUDA提供程序选项: {provider_options}, 指定device_id={device_id}")
+                    'do_copy_in_default_stream': True
+                }),
+                'CPUExecutionProvider'  # 恢复CPU Provider作为备选
+            ]
+            
+            # 最大尝试次数
+            max_attempts = 3
+            attempt = 0
+            success = False
+            
+            while attempt < max_attempts and not success:
+                attempt += 1
+                logger.info(f"[{stats.request_id}] 尝试加载模型 (第{attempt}次尝试)")
                 
-                # 明确设置提供程序顺序 - 确保CUDA优先
-                execution_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-                logger.info(f"[{stats.request_id}] 明确设置提供程序顺序: {execution_providers}")
+                try:
+                    # 尝试加载模型
+                    if 'CUDAExecutionProvider' in ort_providers:
+                        # 使用GPU提供者
+                        self._model = SenseVoiceSmall(
+                            config.MODEL_DIR,
+                            batch_size=config.BATCH_SIZE,
+                            quantize=True,
+                            providers=providers,
+                            device='cuda'
+                        )
+                        logger.info(f"[{stats.request_id}] 成功使用GPU提供者加载模型")
+                    else:
+                        # 回退到CPU
+                        self._model = SenseVoiceSmall(
+                            config.MODEL_DIR,
+                            batch_size=config.BATCH_SIZE,
+                            quantize=True,
+                            providers=['CPUExecutionProvider'],
+                            device='cpu'
+                        )
+                        logger.info(f"[{stats.request_id}] 成功使用CPU提供者加载模型")
+                    
+                    success = True
+                except Exception as e:
+                    logger.warning(f"[{stats.request_id}] 模型加载失败 (尝试 {attempt}/{max_attempts}): {str(e)}")
+                    
+                    if attempt == max_attempts:
+                        # 最后一次尝试，尝试不指定providers
+                        try:
+                            logger.info(f"[{stats.request_id}] 最后尝试: 使用默认提供者")
+                            self._model = SenseVoiceSmall(
+                                config.MODEL_DIR,
+                                batch_size=config.BATCH_SIZE,
+                                quantize=True
+                            )
+                            logger.info(f"[{stats.request_id}] 成功使用默认提供者加载模型")
+                            success = True
+                        except Exception as final_e:
+                            logger.error(f"[{stats.request_id}] 所有加载尝试均失败: {str(final_e)}")
+                            raise
+                    
+                    # 短暂等待后重试
+                    if not success and attempt < max_attempts:
+                        time.sleep(2)
             
-            # 加载模型，尝试明确指定Provider
+            stats.record_step("模型加载完成")
+            logger.info(f"[{stats.request_id}] 模型加载完成，使用时间: {stats.total_time():.4f}秒")
+            
+            # 验证模型是否可用
             try:
-                if 'CUDAExecutionProvider' in providers:
-                    self._model = SenseVoiceSmall(
-                        config.MODEL_DIR, 
-                        batch_size=config.BATCH_SIZE, 
-                        quantize=True,
-                        providers=execution_providers,
-                        provider_options=provider_options
-                    )
-                    logger.info(f"[{stats.request_id}] 使用CUDA提供程序加载模型")
-                else:
-                    self._model = SenseVoiceSmall(
-                        config.MODEL_DIR, 
-                        batch_size=config.BATCH_SIZE, 
-                        quantize=True
-                    )
-                    logger.info(f"[{stats.request_id}] 使用默认提供程序加载模型")
-            except TypeError as te:
-                # 如果SenseVoiceSmall不接受provider_options参数，使用默认构造
-                logger.warning(f"[{stats.request_id}] SenseVoiceSmall加载异常: {str(te)}")
-                logger.warning(f"[{stats.request_id}] SenseVoiceSmall不支持provider_options参数，使用默认加载方式")
-                self._model = SenseVoiceSmall(
-                    config.MODEL_DIR, 
-                    batch_size=config.BATCH_SIZE, 
-                    quantize=True
-                )
-            
-            # 记录加载时间
-            load_time = stats.total_time()
-            logger.info(f"[{stats.request_id}] 模型加载成功，耗时: {load_time:.2f}秒")
-            
-            # 打印模型信息
-            try:
-                model_info = getattr(self._model, "get_model_info", lambda: "不支持获取模型信息")
-                if callable(model_info):
-                    logger.info(f"[{stats.request_id}] 模型信息: {model_info()}")
+                # 创建一个小的测试输入
+                test_audio_data = os.path.join(os.path.dirname(__file__), "test_data", "test.wav")
+                
+                # 如果测试文件不存在，则创建一个简单的测试WAV文件
+                if not os.path.exists(test_audio_data):
+                    os.makedirs(os.path.dirname(test_audio_data), exist_ok=True)
+                    import numpy as np
+                    import wave
+                    
+                    # 创建一个持续1秒的静音WAV文件
+                    sample_rate = 16000
+                    duration = 1  # 秒
+                    silence = np.zeros(sample_rate * duration, dtype=np.int16)
+                    
+                    with wave.open(test_audio_data, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sample_rate)
+                        wf.writeframes(silence.tobytes())
+                
+                # 执行一次测试推理
+                logger.info(f"[{stats.request_id}] 执行模型验证测试...")
+                test_start = time.time()
+                results = self._model([test_audio_data])
+                test_duration = time.time() - test_start
+                
+                logger.info(f"[{stats.request_id}] 模型验证成功，推理时间: {test_duration:.4f}秒")
+                return True
             except Exception as e:
-                logger.warning(f"[{stats.request_id}] 无法获取模型信息: {str(e)}")
-            
-            return True
+                logger.error(f"[{stats.request_id}] 模型验证失败: {str(e)}")
+                return False
             
         except Exception as e:
-            logger.error(f"模型加载失败: {str(e)}")
+            logger.error(f"[{stats.request_id}] 模型加载失败: {str(e)}")
             return False
     
     def get_model(self) -> Optional[SenseVoiceSmall]:
@@ -220,11 +261,11 @@ class ModelManager:
             转录结果列表
         """
         if not self.is_loaded():
-            logger.error("model not loaded, cannot transcribe")
+            logger.error("模型未加载，无法转录")
             return None
         
         if stats:
-            logger.info(f"[{stats.request_id}] transcribing, audio count: {len(audio_paths)}, language: {language}, use ITN: {use_itn}")
+            logger.info(f"[{stats.request_id}] 开始转录, 音频数量: {len(audio_paths)}, 语言: {language}, 使用ITN: {use_itn}")
             
         # 进行推理
         try:
@@ -235,15 +276,15 @@ class ModelManager:
             if stats:
                 stats.record_step("模型推理")
                 avg_time = inference_time / len(audio_paths) if audio_paths else 0
-                logger.info(f"[{stats.request_id}] transcribed successfully, cost: {inference_time:.4f}s, avg per file: {avg_time:.4f}s")
+                logger.info(f"[{stats.request_id}] 转录成功，总耗时: {inference_time:.4f}s, 平均每个文件: {avg_time:.4f}s")
             
             return results
             
         except Exception as e:
             if stats:
-                logger.error(f"[{stats.request_id}] transcription failed: {str(e)}")
+                logger.error(f"[{stats.request_id}] 转录失败: {str(e)}")
             else:
-                logger.error(f"transcription failed: {str(e)}")
+                logger.error(f"转录失败: {str(e)}")
             return None
     
     def transcribe_stream(self, audio_path: str, language="auto", use_itn=True, 

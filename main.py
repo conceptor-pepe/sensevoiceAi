@@ -14,7 +14,10 @@ from logger import logger
 
 # 显式配置GPU环境
 def configure_gpu():
-    """配置GPU环境"""
+    """
+    配置GPU环境
+    设置CUDA和ONNX Runtime的环境变量
+    """
     # 记录环境变量
     gpu_device = os.environ.get("CUDA_VISIBLE_DEVICES", "未设置")
     sensevoice_gpu = os.environ.get("SENSEVOICE_GPU_DEVICE", "未设置")
@@ -43,35 +46,25 @@ def configure_gpu():
             target_gpu = int(config.GPU_DEVICE)
             logger.info(f"目标使用GPU设备ID: {target_gpu}")
             
-            # 设置提供程序选项
-            provider_options = {
-                'device_id': target_gpu,
-                'arena_extend_strategy': 'kNextPowerOfTwo',
-                'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2GB
-                'cudnn_conv_algo_search': 'EXHAUSTIVE',
-                'do_copy_in_default_stream': True,
-            }
-            
-            # 1. 首先设置CUDA_VISIBLE_DEVICES环境变量
+            # 1. 设置CUDA_VISIBLE_DEVICES环境变量
             os.environ["CUDA_VISIBLE_DEVICES"] = str(target_gpu)
             logger.info(f"已设置CUDA_VISIBLE_DEVICES={target_gpu}")
             
             # 2. 设置ONNX Runtime特定环境变量
             os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1"  # 启用FP16
-            os.environ["ORT_CUDA_DEVICE"] = str(target_gpu)  # 设置CUDA设备ID
+            os.environ["ORT_CUDA_DEVICE"] = "0"  # 设置CUDA设备ID为0（CUDA_VISIBLE_DEVICES已经指定了实际设备）
             
-            # 3. 额外设置供onnxruntime使用的环境变量
+            # 3. 设置其他优化环境变量
             os.environ["OMP_NUM_THREADS"] = "1"  # 限制OMP线程数
             os.environ["ORT_THREAD_POOL_ALLOW_SPINNING"] = "0"  # 禁用线程池自旋
             
-            logger.info(f"已配置ONNX Runtime CUDA提供程序选项: {provider_options}")
-            logger.info(f"已设置环境变量: ORT_TENSORRT_FP16_ENABLE=1, ORT_CUDA_DEVICE={target_gpu}")
+            logger.info(f"已设置环境变量: ORT_TENSORRT_FP16_ENABLE=1, ORT_CUDA_DEVICE=0")
             
-            # 尝试设置ONNX Runtime日志级别，不再调用不存在的set_session_options方法
+            # 尝试设置ONNX Runtime日志级别
             try:
                 if hasattr(ort, 'set_default_logger_severity'):
-                    ort.set_default_logger_severity(0)  # 设置日志级别为详细
-                    logger.info("已设置ONNX Runtime日志级别为详细")
+                    ort.set_default_logger_severity(3)  # 设置日志级别为警告
+                    logger.info("已设置ONNX Runtime日志级别")
             except Exception as e:
                 logger.warning(f"无法设置ONNX Runtime日志级别: {str(e)}")
         else:
@@ -81,17 +74,52 @@ def configure_gpu():
     except Exception as e:
         logger.error(f"配置GPU时出错: {str(e)}")
 
+def check_dependencies():
+    """
+    检查依赖项
+    确保所有必要的库都已安装
+    """
+    required_packages = [
+        "fastapi", "uvicorn", "numpy", 
+        "pydantic", "onnxruntime", "websockets"
+    ]
+    
+    missing_packages = []
+    
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            missing_packages.append(package)
+    
+    if missing_packages:
+        logger.error(f"缺少必要的依赖项: {', '.join(missing_packages)}")
+        logger.error("请先安装依赖: pip install " + " ".join(missing_packages))
+        return False
+    
+    return True
+
 def main():
     """
     应用主入口
     """
+    # 检查依赖项
+    if not check_dependencies():
+        sys.exit(1)
+    
     # 配置GPU环境
     configure_gpu()
     
     # 打印服务配置信息
     config.print_config()
     
-    # 导入应用（在配置完GPU后导入，确保正确配置）
+    # 预加载模型（在导入api之前）
+    from model_manager import model_manager
+    if not model_manager.is_loaded():
+        logger.info("预加载模型...")
+        model_manager.load_model()
+    
+    # 导入应用（在配置完GPU后导入）
     from api import app
     
     # 启动服务
@@ -99,7 +127,8 @@ def main():
     uvicorn.run(
         app, 
         host=config.API_HOST, 
-        port=config.API_PORT
+        port=config.API_PORT,
+        log_level="warning"  # 降低uvicorn日志级别
     )
 
 if __name__ == "__main__":

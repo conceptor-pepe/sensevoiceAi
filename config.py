@@ -14,8 +14,8 @@ API_PORT = int(os.environ.get("SENSEVOICE_PORT", "8000"))  # 服务端口,默认
 
 # 模型配置
 MODEL_DIR = os.environ.get("SENSEVOICE_MODEL_DIR", "iic/SenseVoiceSmall")  # 模型目录
-GPU_DEVICE = os.environ.get("SENSEVOICE_GPU_DEVICE", "0")  # GPU设备ID
-BATCH_SIZE = int(os.environ.get("SENSEVOICE_BATCH_SIZE", "1"))  # 批处理大小
+GPU_DEVICE = os.getenv("SENSEVOICE_GPU_DEVICE", "5")  # 默认使用GPU 5
+BATCH_SIZE = int(os.getenv("SENSEVOICE_BATCH_SIZE", "1"))  # 根据显存调整
 
 # 日志配置
 LOG_LEVEL = os.environ.get("SENSEVOICE_LOG_LEVEL", "INFO")  # 日志级别,默认INFO
@@ -53,6 +53,9 @@ EMOTION_TAGS = ["<|HAPPY|>", "<|SAD|>", "<|ANGRY|>", "<|NEUTRAL|>",
 # 事件标签
 EVENT_TAGS = ["<|BGM|>", "<|Speech|>", "<|Applause|>", "<|Laughter|>", 
               "<|Cry|>", "<|Sneeze|>", "<|Breath|>", "<|Cough|>"]  # 事件标识标签
+
+# 显存限制（根据您的GPU调整）
+GPU_MEMORY_LIMIT = 20 * 1024 * 1024 * 1024  # 20GB for RTX 4090
 
 def get_log_level():
     """获取配置的日志级别"""

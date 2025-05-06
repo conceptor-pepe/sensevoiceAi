@@ -32,6 +32,20 @@ class TimeStats:
         unique_id = uuid.uuid4().hex[:8]
         self.request_id = f"{prefix}_{timestamp}_{unique_id}" if prefix else f"req_{timestamp}_{unique_id}"
     
+    def __enter__(self):
+        """
+        上下文管理器入口方法，支持with语句
+        """
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        上下文管理器退出方法，支持with语句
+        """
+        if exc_type:
+            logger.error(f"[{self.request_id}] 执行过程发生异常: {exc_val}")
+        return False  # 不抑制异常传播
+    
     def record_step(self, step_name):
         """
         记录一个处理步骤的时间
