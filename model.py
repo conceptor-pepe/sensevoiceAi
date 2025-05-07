@@ -3,7 +3,6 @@
 """
 模型模块 - 实现SenseVoiceSmall模型类封装（优化版）
 使用funasr-onnx实现，避免modelscope额外依赖
-注：使用改进的方法减少临时文件IO操作
 """
 import os
 import re

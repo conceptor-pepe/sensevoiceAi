@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API模块 - 提供FastAPI接口服务（优化版，去除缓存和IO操作）
+API模块 - 提供FastAPI接口服务
 """
 import os
 import time
@@ -83,25 +83,6 @@ except Exception as e:
     logger.error(f"模型加载失败: {str(e)}")
     logger.error(traceback.format_exc())
     raise
-
-# --- API端点 ---
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    """返回API首页"""
-    return """
-    <!DOCTYPE html>
-    <html>
-        <head>
-            <meta charset=utf-8>
-            <title>SenseVoice API信息</title>
-        </head>
-        <body>
-            <h1>SenseVoice语音识别API</h1>
-            <p>这是SenseVoice语音识别服务</p>
-            <a href='./docs'>API文档</a>
-        </body>
-    </html>
-    """
 
 @app.get("/status")
 async def get_status():
@@ -286,13 +267,13 @@ async def turn_audio_to_text(
         # 返回错误响应
         raise HTTPException(500, str(e))
 
-if __name__ == "__main__":
-    import uvicorn
-    logger.info(f"启动API服务 127.0.0.1:8000")
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        workers=1,
-        log_config=None
-    )
+# if __name__ == "__main__":
+#     import uvicorn
+#     logger.info(f"启动API服务 127.0.0.1:8000")
+#     uvicorn.run(
+#         app, 
+#         host="0.0.0.0", 
+#         port=8000,
+#         workers=1,
+#         log_config=None
+#     )

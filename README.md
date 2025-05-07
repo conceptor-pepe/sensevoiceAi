@@ -4,19 +4,49 @@
 
 ## 功能特点
 
-- **支持多种音频格式**: WAV, MP3, AAC, AMR, FLAC, OGG, OPUS, M4A, WEBM, WMA
-- **自动音频处理**: 自动重采样、单声道转换
-- **高性能GPU加速**: 支持CUDA加速，优化显存使用
-- **结果缓存**: 对相同音频请求进行缓存，提高响应速度
-- **系统服务集成**: 支持作为systemd服务运行
-- **详细性能指标**: 记录各阶段处理时间，便于性能分析
-- **完整API文档**: 自动生成的Swagger文档
+- **多格式音频支持**: 自动处理WAV, MP3, AAC, AMR, FLAC, OGG, OPUS, M4A, WEBM, WMA格式
+- **自动音频处理**: 智能重采样、单声道转换，无需预处理
+- **高性能GPU加速**: 支持CUDA加速，优化显存使用，提高推理速度
+- **系统服务集成**: 作为systemd服务运行，实现开机自启和故障自恢复
+- **完整性能监控**: 记录各阶段处理时间和资源使用，便于性能分析
+- **完整API文档**: 集成Swagger文档，方便开发集成
+- **结构化日志系统**: 详细记录操作日志和错误信息，方便问题定位
+
+## 系统架构
+
+### 整体架构
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│                 │    │                 │    │                 │
+│  客户端应用     │───>│  SenseVoice API │───>│  模型推理引擎   │
+│  (Web/移动应用) │    │  (FastAPI服务)  │    │  (ONNX运行时)   │
+│                 │    │                 │    │                 │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+                              │                        │
+                              │                        │
+                              ▼                        ▼
+                       ┌─────────────┐         ┌─────────────────┐
+                       │             │         │                 │
+                       │ 音频处理器  │         │   性能监控      │
+                       │             │         │                 │
+                       └─────────────┘         └─────────────────┘
+```
+
+### 核心组件
+
+- **API服务**: FastAPI应用，提供RESTful接口
+- **模型管理器**: 负责模型加载、推理和资源管理
+- **音频处理器**: 处理各种格式的音频输入
+- **性能监控**: 记录各组件性能指标
+- **日志系统**: 结构化日志记录和错误追踪
 
 ## 系统要求
 
 - Python 3.8+
 - NVIDIA GPU (CUDA 11.0+)
 - 至少8GB显存
+- Linux系统 (推荐Ubuntu 20.04+)
 
 ## 快速安装
 
@@ -38,7 +68,14 @@ sudo bash install.sh
 pip install -r requirements.txt
 ```
 
-2. 配置服务:
+2. 创建日志目录:
+
+```bash
+sudo mkdir -p /var/log/sensevoice
+sudo chmod 755 /var/log/sensevoice
+```
+
+3. 配置服务:
 
 ```bash
 sudo cp senseaudio.service /etc/systemd/system/
@@ -49,25 +86,12 @@ sudo systemctl start senseaudio
 
 ## 使用方法
 
-### API接口
-
-服务启动后，API接口可通过 `http://localhost:8000` 访问。
+### API接口示例
 
 #### 1. 音频转写接口
 
-```
-POST /transcribe
-```
-
-**参数:**
-
-- `audio`: 音频文件 (multipart/form-data)
-- `language`: 语言设置 (auto/zh/en/ja...)，默认为auto
-- `textnorm`: 文本规范化设置 (withitn/noitn)，默认为withitn
-
-**示例请求:**
-
 ```bash
+# 使用curl发送POST请求转写音频
 curl -X POST "http://localhost:8000/transcribe" \
   -H "accept: application/json" \
   -H "Content-Type: multipart/form-data" \
@@ -75,44 +99,48 @@ curl -X POST "http://localhost:8000/transcribe" \
   -F "language=auto"
 ```
 
-**响应:**
+**响应示例:**
 
 ```json
 {
   "status": "success",
   "text": "这是识别出的文本内容",
-  "cached": false,
   "processing_time": 1.234,
-  "sample_rate": "16000Hz",
-  "device": "GPU5(NVIDIA RTX A6000)"
+  "device": "cuda:5"
 }
 ```
 
-#### 2. 服务状态接口
+#### 2. 批量转写接口
 
-```
-GET /status
+```bash
+# 使用curl发送POST请求批量转写多个音频
+curl -X POST "http://localhost:8000/api/v1/asr" \
+  -H "accept: application/json" \
+  -H "Content-Type: multipart/form-data" \
+  -F "files=@/path/to/audio1.mp3" \
+  -F "files=@/path/to/audio2.mp3" \
+  -F "keys=audio1,audio2" \
+  -F "lang=auto"
 ```
 
-**响应:**
+#### 3. 服务状态查询
+
+```bash
+# 使用curl获取服务状态
+curl -X GET "http://localhost:8000/status"
+```
+
+**响应示例:**
 
 ```json
 {
   "status": "running",
-  "version": "1.3",
+  "version": "1.4",
   "gpu_status": {
-    "status": "available",
+    "available": true,
     "device_count": 1,
-    "devices": [
-      {
-        "id": 0,
-        "name": "NVIDIA RTX A6000",
-        "memory_total": 51539607552,
-        "memory_allocated": 1073741824,
-        "memory_reserved": 2147483648
-      }
-    ],
-    "current_device": "cuda:0"
+    "current_device": "cuda:5",
+    "device_name": "NVIDIA RTX A6000"
   },
   "metrics": {
     "audio_processing_time": {
@@ -147,7 +175,6 @@ python main.py --help
 - `--port`: 服务端口号 (默认: 8000)
 - `--workers`: Worker进程数 (默认: 1)
 - `--gpu`: 使用的GPU设备ID (默认: 5)
-- `--cache`: 是否启用缓存 (默认: True)
 - `--debug`: 是否启用调试模式
 
 ## 项目结构
@@ -160,6 +187,7 @@ python main.py --help
 ├── logger.py           # 日志和性能监控
 ├── main.py             # 主程序入口
 ├── model_manager.py    # 模型管理器
+├── model.py            # 模型定义
 ├── requirements.txt    # 依赖管理
 ├── install.sh          # 安装脚本
 └── senseaudio.service  # systemd服务配置
@@ -167,18 +195,42 @@ python main.py --help
 
 ## 性能优化
 
-- **显存优化**: 自动计算并限制GPU显存使用量
-- **缓存机制**: 对处理过的音频结果进行缓存
-- **后台任务**: 使用后台任务清理临时文件
-- **模型单例**: 确保只加载一个模型实例
+- **GPU内存优化**: 自动计算并限制GPU显存使用量
+- **ONNX运行时配置**: 针对GPU优化的执行提供者配置
+- **多线程控制**: 通过环境变量控制线程数量
+- **TensorRT加速**: 支持FP16推理加速
+- **并发处理**: 使用FastAPI的异步能力提高并发性能
 
 ## 日志与监控
 
-服务运行日志存储在 `logs/senseaudio.log`，同时也会输出到系统日志。
+系统提供了完整的日志记录和性能监控能力：
 
-通过系统日志查看服务状态:
+- **结构化日志**: 所有日志记录采用结构化格式，包含时间戳、日志级别、进程/线程信息
+- **多级日志**: 分为主日志、错误日志和访问日志，便于问题追踪
+- **日志轮转**: 支持基于时间的日志轮转和保留策略，默认每天轮转，保留7天
+- **性能指标**: 记录各阶段处理时间，便于性能分析和问题定位
+
+### 日志目录结构
+
+所有日志存放在 `/var/log/sensevoice` 目录下：
+
+- `senseaudio.log` - 主日志文件，记录所有日志信息
+- `senseaudio_error.log` - 错误日志，仅记录ERROR及以上级别的信息
+- `senseaudio_access.log` - 访问日志，记录API访问信息
+
+### 查看日志
 
 ```bash
+# 查看主日志
+sudo tail -f /var/log/sensevoice/senseaudio.log
+
+# 查看错误日志
+sudo tail -f /var/log/sensevoice/senseaudio_error.log
+
+# 查看访问日志
+sudo tail -f /var/log/sensevoice/senseaudio_access.log
+
+# 查看系统日志
 journalctl -u senseaudio -f
 ```
 
@@ -194,90 +246,32 @@ journalctl -u senseaudio -f
 sudo systemctl restart senseaudio
 ```
 
-## 详细说明文档
+## 处理流程详解
 
-### SenseVoice API处理流程
-
-当用户发送请求（如`curl -X POST -F "audio=@./zh.mp3" http://localhost:8000/transcribe`）时，系统按以下步骤处理：
+当用户发送请求时，系统按以下步骤处理：
 
 1. **请求接收与验证**
    - FastAPI接收POST请求到`/transcribe`端点
-   - 验证音频文件格式是否在支持列表中（WAV, MP3, AAC等）
+   - 验证音频文件格式是否在支持列表中
    - 格式无效则返回400错误
 
-2. **缓存检查**
-   - 读取音频内容并计算唯一MD5哈希值
-   - 使用哈希值查询缓存系统
-   - 如果缓存命中，直接返回缓存结果，跳过处理步骤
-
-3. **音频处理**（缓存未命中时）
-   - 将原始音频保存为临时文件
-   - 通过librosa进行音频处理：
-     * 重采样到16kHz（标准采样率）
+2. **音频处理**
+   - 读取音频内容
+   - 通过音频处理器进行处理：
+     * 重采样到16kHz
      * 转换为单声道（如果是多声道）
-   - 处理后的音频保存为临时WAV文件
+   - 将处理后的音频转换为张量
 
-4. **语音识别**
-   - 调用ModelManager中的transcribe方法
-   - 使用SenseVoiceSmall模型进行语音识别
+3. **语音识别**
+   - 调用模型进行推理
    - 获取识别文本结果
 
-5. **结果处理**
+4. **结果处理**
    - 构建包含文本结果、处理时间等信息的JSON响应
-   - 将结果添加到缓存系统（使用之前的哈希值）
-   - 安排后台任务清理临时文件
+   - 记录性能指标
    - 将结果返回给用户
 
-6. **全程性能监控**
+5. **全程性能监控**
    - 各处理阶段的时间被记录到PerformanceMonitor
    - 整个函数执行时间由timer装饰器记录
    - 异常处理机制确保错误被记录并向用户返回适当响应
-
-### 架构特点
-
-- **模块化设计**：处理流程分散在不同模块，职责明确
-- **异步处理**：使用FastAPI的异步能力提高并发性
-- **缓存机制**：通过音频指纹避免重复处理相同音频
-- **资源管理**：后台任务确保临时文件被正确清理
-- **性能监控**：详细记录各阶段处理时间，便于优化
-
-image.png
-
-## 性能优化说明
-
-### 最新优化
-
-本次优化旨在提高API服务的性能，主要包括以下方面：
-
-1. **直接使用ONNX推理**
-   - 使用更高效的ONNX运行时加速推理
-   - 原有架构：ModelManager -> SenseVoiceSmall
-   - 优化架构：直接使用SenseVoiceSmall
-
-2. **简化模型加载与初始化**
-   - 移除了多层封装和依赖注入
-   - 全局单例模型初始化，避免重复加载
-   - 减少不必要的日志和检查
-
-3. **添加兼容API接口**
-   - 添加`/api/v1/asr`端点支持批量处理
-   - 自定义结果格式，提供原始和处理后的文本
-   - 兼容其他服务的API调用方式
-
-4. **内存优化**
-   - 使用BytesIO处理内存中的数据
-   - 减少不必要的数据转换
-   - 添加异常处理和资源清理
-
-5. **环境变量控制**
-   - 支持通过`SENSEVOICE_DEVICE`环境变量切换GPU设备
-   - 自动配置CUDA可见设备
-
-### 性能结果
-
-- 原有版本：约5秒处理时间
-- 优化版本：约1秒处理时间
-
-## 许可证
-
-[Apache 2.0](LICENSE)

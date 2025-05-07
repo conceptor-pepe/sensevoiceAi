@@ -4,7 +4,15 @@
 配置模块 - 集中管理应用所有配置项（优化版）
 """
 import os
+import socket
 from pathlib import Path
+
+# --- 基础路径配置 ---
+# 应用根目录（获取当前文件所在目录的父目录）
+BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 日志目录路径（系统日志目录）
+LOG_DIR = Path("/var/log/sensevoice")
+# 不在此处创建目录，因为可能需要root权限，将在启动脚本和服务文件中处理
 
 # --- 基础配置 ---
 # GPU设备配置
@@ -26,20 +34,13 @@ MODEL_DEVICE = "cuda"  # 推理设备
 MODEL_CACHE_DIR = os.path.expanduser("~/.cache/modelscope/hub")  # 模型缓存目录
 
 # --- API配置 ---
-API_HOST = "0.0.0.0"
-API_PORT = 8000
+API_HOST = "0.0.0.0"  # API服务监听地址（所有网络接口）
+API_PORT = 8000  # API服务端口
 API_WORKERS = 1  # Worker进程数
-API_TITLE = "SenseVoiceSmall ASR API"
-API_DESCRIPTION = "支持多种音频格式的语音识别服务"
-API_VERSION = "1.4"  # 更新版本号
-
-# --- 缓存配置 ---
-# 禁用文件缓存以避免IO操作
-CACHE_ENABLED = False  # 禁用缓存
-CACHE_DIR = Path("/tmp/senseaudio_cache")  # 缓存目录（即使禁用也保留配置项）
-CACHE_DIR.mkdir(exist_ok=True, parents=True)  # 确保缓存目录存在
-CACHE_MAX_SIZE = 0  # 最大缓存条目数（已禁用）
-CACHE_TTL = 0  # 缓存过期时间（已禁用）
+API_TITLE = "SenseVoiceSmall ASR API"  # API服务标题
+API_DESCRIPTION = "支持多种音频格式的语音识别服务"  # API服务描述
+API_VERSION = "1.4"  # API版本号
+HOSTNAME = socket.gethostname()  # 主机名，用于日志记录和服务识别
 
 # --- 性能优化配置 ---
 # ONNX运行时设置
@@ -52,10 +53,12 @@ os.environ["MKL_NUM_THREADS"] = str(ONNX_INTRA_OP_THREADS)
 os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1"  # 启用TensorRT FP16
 
 # --- 日志配置 ---
-LOG_LEVEL = "INFO"
-LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True, parents=True)  # 确保日志目录存在
-LOG_FILE = LOG_DIR / "senseaudio.log"  # 日志文件路径
-LOG_ROTATION = "1 day"  # 日志轮转周期
-LOG_RETENTION = "7 days"  # 日志保留时间 
+LOG_LEVEL = "INFO"  # 日志级别
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'  # 日志格式
+LOG_FILE = LOG_DIR / f"senseaudio.log"  # 主日志文件
+ERROR_LOG_FILE = LOG_DIR / f"senseaudio_error.log"  # 错误日志文件
+ACCESS_LOG_FILE = LOG_DIR / f"senseaudio_access.log"  # 访问日志文件
+LOG_ROTATION = "1 day"  # 日志轮转周期（每天轮转）
+LOG_RETENTION = "7 days"  # 日志保留时间（保留7天）
+LOG_COMPRESSION = "gz"  # 日志压缩格式
+MAX_LOG_SIZE = "100MB"  # 单个日志文件最大大小 
