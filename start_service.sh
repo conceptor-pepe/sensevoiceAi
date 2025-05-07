@@ -1,6 +1,24 @@
 #!/bin/bash
-# SenseVoice API服务启动脚本（优化版）
-# 注: 此版本已优化性能，去除缓存和临时IO操作，并使用单例模式
+# SenseVoice ASR API 服务启动脚本（GPU优化版）
+
+# 设置CUDA和GPU相关环境变量（确保使用5号GPU）
+export CUDA_VISIBLE_DEVICES=5  # 使用5号GPU
+export SENSEVOICE_DEVICE="cuda:5"  # 设置设备为CUDA:5
+export SENSEVOICE_GPU_ID=5  # GPU ID
+
+# 设置ONNX运行时优化参数
+export ONNX_INTER_OP_THREADS=1  # 限制线程数，减少CPU使用
+export ONNX_INTRA_OP_THREADS=4
+export OMP_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export VECLIB_MAXIMUM_THREADS=4
+export NUMEXPR_NUM_THREADS=4
+
+# 强制使用CUDA执行提供者
+export ONNXRUNTIME_PROVIDER="CUDAExecutionProvider"
+export ORT_TENSORRT_FP16_ENABLE=1
+export ORT_TENSORRT_ENABLE=1
 
 # 设置环境变量
 export PYTHONPATH=$(pwd):$PYTHONPATH
@@ -8,8 +26,7 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 # 默认配置
 PORT=8000
 HOST="0.0.0.0"
-DEVICE="cuda:5"
-GPU_ID=5  # 直接使用数字形式的GPU ID
+GPU_ID=5  # 使用5号GPU
 WORKERS=1
 DEBUG=false
 # 性能优化选项

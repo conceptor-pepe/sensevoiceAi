@@ -58,20 +58,52 @@ class SenseVoiceSmall:
         if "cuda" in device:
             device_id = int(device.split(":")[-1]) if ":" in device else 0
             os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
-            use_device = "cuda"
+            # 确保实际使用cuda设备
+            use_device = "cuda"  # 这里是关键修改，确保使用 "cuda" 而不是其他值
+            
+            # 记录CUDA设备配置信息
+            print(f"CUDA配置：CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+            print(f"当前CUDA可用: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                print(f"CUDA设备数量: {torch.cuda.device_count()}")
+                print(f"CUDA当前设备: {torch.cuda.current_device()}")
+                print(f"CUDA设备名称: {torch.cuda.get_device_name(device_id)}")
         else:
             use_device = device
+            print(f"使用CPU设备: {device}")
             
         # 提取批处理大小和量化设置
         batch_size = kwargs.get("batch_size", 1)
         quantize = kwargs.get("quantize", True)
         
         print(f"创建SenseVoiceSmall模型，目录: {model}, 设备: {use_device}")
+        
+        # 配置ONNX运行时的GPU设置
+        # 计算内存限制
+        gpu_mem_limit = None
+        providers = None
+        
+        if use_device == "cuda" and torch.cuda.is_available():
+            gpu_mem_limit = int(torch.cuda.get_device_properties(device_id).total_memory * 0.8)
+            # 设置CUDA执行提供者
+            providers = [
+                (
+                    "CUDAExecutionProvider", 
+                    {
+                        "device_id": device_id,
+                        "gpu_mem_limit": gpu_mem_limit,
+                        "arena_extend_strategy": "kSameAsRequested"
+                    }
+                )
+            ]
+            print(f"配置ONNX运行时使用CUDA，内存限制: {gpu_mem_limit}, 设备ID: {device_id}")
+            
         model_instance = SV_ONNX(
             model_dir=model,
             batch_size=batch_size,
             quantize=quantize,
             device=use_device,
+            providers=providers,  # 传递执行提供者配置
             download_dir=kwargs.get("download_dir", None)
         )
         
@@ -94,7 +126,7 @@ class SenseVoiceSmall:
         **kwargs
     ) -> List[List[Dict[str, Any]]]:
         """
-        执行语音识别推理（优化版，通过临时文件传递给模型）
+        执行语音识别推理（优化版，减少临时文件操作）
         
         Args:
             data_in: 输入音频张量列表
@@ -122,9 +154,31 @@ class SenseVoiceSmall:
                 audio_name = key[i] if key and i < len(key) else f"audio_{i}"
                 actual_keys.append(audio_name)
             
-            # 将音频张量保存为临时文件
+            # 尝试直接使用GPU处理音频数据
+            if torch.cuda.is_available() and hasattr(self.model, 'infer_from_tensor'):
+                try:
+                    # 移动音频张量到GPU
+                    gpu_tensors = [tensor.cuda() for tensor in data_in]
+                    
+                    # 直接使用张量进行推理
+                    results = self.model.infer_from_tensor(gpu_tensors, language=language, textnorm=textnorm)
+                    
+                    # 构建结果
+                    for i, text in enumerate(results):
+                        if i < len(actual_keys):
+                            batch_results.append({
+                                "key": actual_keys[i],
+                                "text": text,
+                                "lang": language,
+                            })
+                    
+                    return [batch_results]
+                except (AttributeError, Exception) as e:
+                    print(f"直接张量推理失败，回退到临时文件方式: {e}")
+            
+            # 将音频张量保存为临时文件（优化版本）
             for i, audio_tensor in enumerate(data_in):
-                # 创建临时文件
+                # 创建临时文件 - 修复：mkstemp()不支持delete参数
                 fd, temp_path = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
                 

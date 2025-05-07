@@ -69,6 +69,36 @@ class Language(str, Enum):
 try:
     model_dir = config.MODEL_NAME
     device = os.getenv("SENSEVOICE_DEVICE", "cuda:0")
+    
+    # 验证和配置GPU环境
+    if "cuda" in device:
+        gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+        
+        # 检查CUDA是否可用
+        if not torch.cuda.is_available():
+            logger.warning(f"CUDA不可用，将使用CPU进行推理")
+            device = "cpu"
+        else:
+            # 记录当前CUDA设备信息
+            logger.info(f"CUDA可用，设备数量: {torch.cuda.device_count()}")
+            logger.info(f"当前CUDA设备ID: {gpu_id}")
+            logger.info(f"当前CUDA设备名称: {torch.cuda.get_device_name(gpu_id)}")
+            
+            # 确保CUDA设备ID有效
+            if gpu_id >= torch.cuda.device_count():
+                logger.warning(f"指定的GPU ID {gpu_id} 无效，将使用设备 0")
+                device = "cuda:0"
+                
+            # 设置环境变量
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            
+            # 显式设置PyTorch使用的设备
+            try:
+                torch.cuda.set_device(gpu_id)
+                logger.info(f"成功设置PyTorch使用CUDA设备 {gpu_id}")
+            except Exception as e:
+                logger.error(f"设置PyTorch设备失败: {str(e)}")
+    
     logger.info(f"正在加载模型：{model_dir}，设备：{device}")
     model, kwargs = SenseVoiceSmall.from_pretrained(
         model=model_dir, 
@@ -79,6 +109,17 @@ try:
     )
     model.eval()
     logger.info(f"模型加载完成")
+    
+    # 在加载后再次验证是否使用了正确的设备
+    if device.startswith("cuda") and torch.cuda.is_available():
+        # 尝试创建一个小的CUDA张量来测试CUDA是否工作
+        try:
+            test_tensor = torch.rand(1, 1000, device="cuda")
+            logger.info(f"CUDA测试成功，当前设备: {test_tensor.device}")
+            del test_tensor  # 释放测试张量
+        except Exception as e:
+            logger.warning(f"CUDA测试失败: {str(e)}")
+    
 except Exception as e:
     logger.error(f"模型加载失败: {str(e)}")
     logger.error(traceback.format_exc())
