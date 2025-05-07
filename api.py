@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-API模块 - 提供FastAPI接口服务
+API模块 - 提供FastAPI接口服务（优化版，去除缓存和IO操作）
 """
 import os
 import time
-import tempfile
+import traceback
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from io import BytesIO
@@ -29,7 +29,7 @@ except ImportError:
 
 import config
 from logger import logger, timer, OperationLogger, PerformanceMonitor
-from audio_processor import AudioProcessor, AudioCache
+from audio_processor import AudioProcessor, audio_processor
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -66,28 +66,23 @@ class Language(str, Enum):
     nospeech = "nospeech"
 
 # 初始化模型（全局单例）
-model_dir = config.MODEL_NAME
-device = os.getenv("SENSEVOICE_DEVICE", "cuda:0")
-logger.info(f"正在加载模型：{model_dir}，设备：{device}")
-model, kwargs = SenseVoiceSmall.from_pretrained(
-    model=model_dir, 
-    device=device,
-    batch_size=config.MODEL_BATCH_SIZE,
-    quantize=config.MODEL_QUANTIZE,
-    download_dir=config.MODEL_CACHE_DIR
-)
-model.eval()
-logger.info(f"模型加载完成")
-
-# 后台清理任务
-def cleanup_temp_file(filepath: str):
-    """清理临时文件"""
-    try:
-        if os.path.exists(filepath):
-            os.unlink(filepath)
-            logger.debug(f"已清理临时文件: {filepath}")
-    except Exception as e:
-        logger.error(f"清理临时文件失败: {filepath} - {e}")
+try:
+    model_dir = config.MODEL_NAME
+    device = os.getenv("SENSEVOICE_DEVICE", "cuda:0")
+    logger.info(f"正在加载模型：{model_dir}，设备：{device}")
+    model, kwargs = SenseVoiceSmall.from_pretrained(
+        model=model_dir, 
+        device=device,
+        batch_size=config.MODEL_BATCH_SIZE,
+        quantize=config.MODEL_QUANTIZE,
+        download_dir=config.MODEL_CACHE_DIR
+    )
+    model.eval()
+    logger.info(f"模型加载完成")
+except Exception as e:
+    logger.error(f"模型加载失败: {str(e)}")
+    logger.error(traceback.format_exc())
+    raise
 
 # --- API端点 ---
 @app.get("/", response_class=HTMLResponse)
@@ -133,12 +128,12 @@ async def get_status():
         }
     except Exception as e:
         logger.error(f"获取状态失败: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(500, f"获取状态失败: {str(e)}")
 
 @app.post("/transcribe")
 @timer
 async def transcribe(
-    background_tasks: BackgroundTasks,
     audio: UploadFile = File(..., description=f"音频文件({', '.join(config.SUPPORTED_AUDIO_FORMATS)})"),
     language: str = "auto",
     textnorm: str = "withitn"
@@ -163,44 +158,16 @@ async def transcribe(
         # 读取音频内容
         content = await audio.read()
         
-        # 计算音频哈希值
-        audio_hash = AudioProcessor.compute_audio_hash(content)
-        
-        # 检查缓存
-        cached_result = AudioCache.get_cached_result(audio_hash)
-        if cached_result:
-            # 缓存命中
-            logger.info(f"缓存命中: {audio.filename}")
-            
-            # 记录缓存命中指标
-            PerformanceMonitor.record_metric("cache_hit", 1)
-            
-            # 更新处理时间
-            total_time = time.time() - start_time
-            
-            # 返回缓存结果
-            return {
-                "status": "success",
-                "text": cached_result.get("text", ""),
-                "cached": True,
-                "processing_time": total_time,
-                "device": cached_result.get("device", "")
-            }
-        
-        # 缓存未命中，保存临时文件
-        with tempfile.NamedTemporaryFile(suffix=Path(audio.filename).suffix, delete=False) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-            
+        # 直接处理音频数据，无需临时文件
         try:
-            # 添加清理任务
-            background_tasks.add_task(cleanup_temp_file, tmp_path)
+            # 处理音频数据（避免写入临时文件）
+            audio_tensor = audio_processor.process_audio_bytes(content)
             
-            # 执行推理
-            results = model([tmp_path], language=language, textnorm=textnorm)
+            # 直接使用模型推理
+            results = model.inference([audio_tensor], language=language, use_itn=(textnorm == "withitn"))
             
             # 获取文本
-            text = results[0] if results else ""
+            text = results[0][0]["text"] if results and results[0] else ""
             
             # 计算总处理时间
             total_time = time.time() - start_time
@@ -209,33 +176,31 @@ async def transcribe(
             result = {
                 "status": "success",
                 "text": text,
-                "cached": False,
                 "processing_time": total_time,
                 "device": device
             }
             
-            # 缓存结果
-            cache_result = {
-                "text": text,
-                "device": result["device"]
-            }
-            AudioCache.cache_result(audio_hash, cache_result)
+            # 记录操作日志
+            OperationLogger.log_operation(
+                operation="转写请求",
+                status="success",
+                details={
+                    "filename": audio.filename,
+                    "language": language,
+                    "processing_time": total_time
+                }
+            )
             
             # 返回结果
             return result
         except Exception as e:
             logger.error(f"推理处理失败: {str(e)}")
+            logger.error(traceback.format_exc())
             raise HTTPException(500, f"推理处理失败: {str(e)}")
-        finally:
-            # 确保清理临时文件
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except:
-                pass
     except Exception as e:
         # 记录错误
         logger.error(f"转写失败: {str(e)}")
+        logger.error(traceback.format_exc())
         
         # 记录操作日志
         OperationLogger.log_operation(
@@ -262,64 +227,68 @@ async def turn_audio_to_text(
     - **lang**: 语言设置
     """
     try:
-        # 处理音频文件
-        temp_files = []
-        audio_paths = []
+        start_time = time.time()
         
-        try:
-            # 将文件保存到临时位置
-            for i, file_content in enumerate(files):
-                # 创建临时文件
-                temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                temp_path = temp_file.name
-                temp_file.write(file_content)
-                temp_file.close()
-                
-                # 记录临时文件和路径
-                temp_files.append(temp_path)
-                audio_paths.append(temp_path)
-            
-            # 处理键名
-            if keys == "":
-                key = ["wav_file_tmp_name"]
-            else:
-                key = keys.split(",")
-            
-            # 执行推理
-            texts = model(audio_paths, language=lang, textnorm="noitn")
-            
-            # 构建结果
-            result = []
-            for i, text in enumerate(texts):
-                audio_name = key[i] if i < len(key) else f"audio_{i}"
-                # 处理文本
-                raw_text = text
-                clean_text = re.sub(regex, "", raw_text, 0, re.MULTILINE)
-                formatted_text = rich_transcription_postprocess(raw_text)
-                
-                result.append({
-                    "key": audio_name,
-                    "text": formatted_text,
-                    "raw_text": raw_text,
-                    "clean_text": clean_text
+        # 解析键名
+        key_list = keys.split(",") if keys else []
+        
+        # 直接处理所有音频数据
+        audio_tensors = []
+        for file_data in files:
+            audio_tensor = audio_processor.process_audio_bytes(file_data)
+            audio_tensors.append(audio_tensor)
+        
+        # 批量推理
+        results = model.inference(
+            audio_tensors, 
+            language=lang, 
+            use_itn=True, 
+            key=key_list
+        )
+        
+        # 格式化结果
+        response = []
+        if results and results[0]:
+            for item in results[0]:
+                response.append({
+                    "key": item.get("key", ""),
+                    "value": item.get("text", "")
                 })
-                
-            return {"result": result}
-        finally:
-            # 清理临时文件
-            for temp_path in temp_files:
-                try:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                except Exception as e:
-                    logger.error(f"清理临时文件失败: {temp_path} - {e}")
+        
+        # 计算总处理时间
+        total_time = time.time() - start_time
+        PerformanceMonitor.record_metric("batch_processing_time", total_time)
+        
+        # 记录操作日志
+        OperationLogger.log_operation(
+            operation="批量转写",
+            status="success",
+            details={
+                "file_count": len(files),
+                "language": lang,
+                "processing_time": total_time
+            }
+        )
+        
+        return response
     except Exception as e:
         # 记录错误
         logger.error(f"批量转写失败: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # 记录操作日志
+        OperationLogger.log_operation(
+            operation="批量转写",
+            status="failure",
+            error=e
+        )
+        
+        # 返回错误响应
         raise HTTPException(500, str(e))
 
 if __name__ == "__main__":
     import uvicorn
+    logger.info(f"启动API服务 127.0.0.1:8000")
     uvicorn.run(
         app, 
         host="0.0.0.0", 

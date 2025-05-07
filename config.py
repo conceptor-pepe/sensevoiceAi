@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-配置模块 - 集中管理应用所有配置项
+配置模块 - 集中管理应用所有配置项（优化版）
 """
 import os
 from pathlib import Path
@@ -31,19 +31,30 @@ API_PORT = 8000
 API_WORKERS = 1  # Worker进程数
 API_TITLE = "SenseVoiceSmall ASR API"
 API_DESCRIPTION = "支持多种音频格式的语音识别服务"
-API_VERSION = "1.3"
+API_VERSION = "1.4"  # 更新版本号
 
 # --- 缓存配置 ---
-CACHE_ENABLED = True  # 是否启用缓存
-CACHE_DIR = Path("/tmp/senseaudio_cache")  # 缓存目录
+# 禁用文件缓存以避免IO操作
+CACHE_ENABLED = False  # 禁用缓存
+CACHE_DIR = Path("/tmp/senseaudio_cache")  # 缓存目录（即使禁用也保留配置项）
 CACHE_DIR.mkdir(exist_ok=True, parents=True)  # 确保缓存目录存在
-CACHE_MAX_SIZE = 1000  # 最大缓存条目数
-CACHE_TTL = 24 * 60 * 60  # 缓存过期时间（秒）
+CACHE_MAX_SIZE = 0  # 最大缓存条目数（已禁用）
+CACHE_TTL = 0  # 缓存过期时间（已禁用）
+
+# --- 性能优化配置 ---
+# ONNX运行时设置
+ONNX_INTER_OP_THREADS = 1  # 内部操作并行线程数
+ONNX_INTRA_OP_THREADS = 4  # 运算符内部线程数
+# 设置环境变量
+os.environ["OMP_NUM_THREADS"] = str(ONNX_INTRA_OP_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(ONNX_INTRA_OP_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(ONNX_INTRA_OP_THREADS)
+os.environ["ORT_TENSORRT_FP16_ENABLE"] = "1"  # 启用TensorRT FP16
 
 # --- 日志配置 ---
 LOG_LEVEL = "INFO"
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-LOG_DIR = Path("logs")  # 日志目录
+LOG_DIR = Path("logs")
 LOG_DIR.mkdir(exist_ok=True, parents=True)  # 确保日志目录存在
 LOG_FILE = LOG_DIR / "senseaudio.log"  # 日志文件路径
 LOG_ROTATION = "1 day"  # 日志轮转周期

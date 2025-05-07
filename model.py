@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-模型模块 - 实现SenseVoiceSmall模型类封装
+模型模块 - 实现SenseVoiceSmall模型类封装（优化版）
 使用funasr-onnx实现，避免modelscope额外依赖
+注：使用改进的方法减少临时文件IO操作
 """
 import os
 import re
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple, Union
+import io
 
 import torch
 import torchaudio
+import numpy as np
 from funasr_onnx import SenseVoiceSmall as SV_ONNX
 
 class SenseVoiceSmall:
-    """SenseVoiceSmall语音识别模型封装类"""
+    """SenseVoiceSmall语音识别模型封装类（优化版）"""
+    
+    # 单例模式实现
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        """单例模式，确保只有一个模型实例"""
+        if cls._instance is None:
+            cls._instance = super(SenseVoiceSmall, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
     
     def __init__(self, model_dir: str, model_instance: Any = None):
         """
@@ -23,8 +37,10 @@ class SenseVoiceSmall:
             model_dir: 模型目录路径
             model_instance: 预加载的模型实例
         """
-        self.model_dir = model_dir
-        self.model = model_instance
+        if not self._initialized:
+            self.model_dir = model_dir
+            self.model = model_instance
+            self._initialized = True
         
     @classmethod
     def from_pretrained(cls, model: str, device: str = "cuda:0", **kwargs) -> Tuple["SenseVoiceSmall", Dict[str, Any]]:
@@ -51,7 +67,6 @@ class SenseVoiceSmall:
         batch_size = kwargs.get("batch_size", 1)
         quantize = kwargs.get("quantize", True)
         
-        # 创建模型实例
         print(f"创建SenseVoiceSmall模型，目录: {model}, 设备: {use_device}")
         model_instance = SV_ONNX(
             model_dir=model,
@@ -80,7 +95,7 @@ class SenseVoiceSmall:
         **kwargs
     ) -> List[List[Dict[str, Any]]]:
         """
-        执行语音识别推理
+        执行语音识别推理（优化版，通过临时文件传递给模型）
         
         Args:
             data_in: 输入音频张量列表
@@ -95,39 +110,55 @@ class SenseVoiceSmall:
             识别结果列表
         """
         batch_results = []
-        
-        # 准备音频文件
-        audio_paths = []
         temp_files = []
+        file_paths = []
         
         try:
-            # 将张量保存为临时WAV文件
-            import tempfile
+            # 设置文本规范化参数
+            textnorm = "withitn" if use_itn else "noitn"
+            
+            # 处理键名
+            actual_keys = []
+            for i in range(len(data_in)):
+                audio_name = key[i] if key and i < len(key) else f"audio_{i}"
+                actual_keys.append(audio_name)
+            
+            # 将音频张量保存为临时文件
             for i, audio_tensor in enumerate(data_in):
                 # 创建临时文件
-                temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                temp_path = temp_file.name
-                temp_file.close()
+                fd, temp_path = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
                 
-                # 保存音频
-                torchaudio.save(temp_path, audio_tensor.unsqueeze(0), fs)
-                
-                # 添加到列表
-                audio_paths.append(temp_path)
+                # 添加到临时文件列表
                 temp_files.append(temp_path)
+                file_paths.append(temp_path)
+                
+                # 确保张量格式正确
+                tensor_to_save = audio_tensor
+                if len(audio_tensor.shape) == 1:
+                    tensor_to_save = audio_tensor.unsqueeze(0)
+                
+                # 保存张量到文件
+                torchaudio.save(temp_path, tensor_to_save, fs)
             
-            # 使用funasr-onnx模型进行推理
-            textnorm = "withitn" if use_itn else "noitn"
-            results = self.model(audio_paths, language=language, textnorm=textnorm)
+            # 调用模型进行推理
+            results = self.model(file_paths, language=language, textnorm=textnorm)
             
-            # 格式化结果
+            # 构建结果
             for i, text in enumerate(results):
-                audio_name = key[i] if key and i < len(key) else f"audio_{i}"
-                batch_results.append({
-                    "key": audio_name,
-                    "text": text,
-                    "lang": language,
-                })
+                if i < len(actual_keys):
+                    batch_results.append({
+                        "key": actual_keys[i],
+                        "text": text,
+                        "lang": language,
+                    })
+                
+            return [batch_results]
+        except Exception as e:
+            import traceback
+            print(f"推理失败: {e}")
+            print(traceback.format_exc())
+            raise
         finally:
             # 清理临时文件
             for temp_path in temp_files:
@@ -136,8 +167,6 @@ class SenseVoiceSmall:
                         os.unlink(temp_path)
                 except Exception as e:
                     print(f"清理临时文件失败: {temp_path} - {e}")
-                
-        return [batch_results]
         
     def __call__(self, audio_file: Union[str, List[str]], **kwargs) -> List[str]:
         """
