@@ -1,320 +1,141 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-API模块 - 提供FastAPI接口服务
-"""
-import os
-import time
-import traceback
-from pathlib import Path
-from typing import Dict, Any, Optional, List
+
+import librosa
+import numpy as np
+import aiohttp
+from fastapi import FastAPI, Form, UploadFile, HTTPException
+from pydantic import HttpUrl, ValidationError, BaseModel, Field
+from typing import List, Union
+from funasr_onnx import SenseVoiceSmall
+from funasr_onnx.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
-from enum import Enum
 
-import torch
-import torchaudio
-import re
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Form
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from typing_extensions import Annotated
-from model import SenseVoiceSmall  # 直接导入模型类
-try:
-    from funasr.utils.postprocess_utils import rich_transcription_postprocess
-except ImportError:
-    # 如果无法导入，提供一个简单的后处理函数
-    def rich_transcription_postprocess(text):
-        return text
+DEVICE_ID = 5
 
-import config
-from logger import logger, timer, OperationLogger, PerformanceMonitor
-from audio_processor import AudioProcessor, audio_processor
+class ApiResponse(BaseModel):
+    message: str = Field(..., description="Status message indicating the success of the operation.")
+    results: str = Field(..., description="Remove label output")
+    label_result: str = Field(..., description="Default output")
 
-# 创建FastAPI应用
-app = FastAPI(
-    title=config.API_TITLE,
-    description=config.API_DESCRIPTION,
-    version=config.API_VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
 
-# 添加CORS支持
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 添加Gzip压缩支持
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-
-# 正则表达式模式：匹配特殊标记，用于后处理
-regex = r"<\|.*\|>"
-
-# 语言选项枚举
-class Language(str, Enum):
-    auto = "auto"
-    zh = "zh"
-    en = "en"
-    yue = "yue"
-    ja = "ja"
-    ko = "ko"
-    nospeech = "nospeech"
-
-# 初始化模型（全局单例）
-try:
-    model_dir = config.MODEL_NAME
-    device = os.getenv("SENSEVOICE_DEVICE", "cuda:0")
+app = FastAPI()
+async def from_url_load_audio(audio: HttpUrl) -> BytesIO:
+    """
+    从URL下载音频文件
     
-    # 验证和配置GPU环境
-    if "cuda" in device:
-        gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+    Args:
+        audio: 音频文件的URL
         
-        # 检查CUDA是否可用
-        if not torch.cuda.is_available():
-            logger.warning(f"CUDA不可用，将使用CPU进行推理")
-            device = "cpu"
-        else:
-            # 记录当前CUDA设备信息
-            logger.info(f"CUDA可用，设备数量: {torch.cuda.device_count()}")
-            logger.info(f"当前CUDA设备ID: {gpu_id}")
-            logger.info(f"当前CUDA设备名称: {torch.cuda.get_device_name(gpu_id)}")
-            
-            # 确保CUDA设备ID有效
-            if gpu_id >= torch.cuda.device_count():
-                logger.warning(f"指定的GPU ID {gpu_id} 无效，将使用设备 0")
-                device = "cuda:0"
-                
-            # 设置环境变量
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            
-            # 显式设置PyTorch使用的设备
-            try:
-                torch.cuda.set_device(gpu_id)
-                logger.info(f"成功设置PyTorch使用CUDA设备 {gpu_id}")
-            except Exception as e:
-                logger.error(f"设置PyTorch设备失败: {str(e)}")
-    
-    logger.info(f"正在加载模型：{model_dir}，设备：{device}")
-    model, kwargs = SenseVoiceSmall.from_pretrained(
-        model=model_dir, 
-        device=device,
-        batch_size=config.MODEL_BATCH_SIZE,
-        quantize=config.MODEL_QUANTIZE,
-        download_dir=config.MODEL_CACHE_DIR
-    )
-    model.eval()
-    logger.info(f"模型加载完成")
-    
-    # 在加载后再次验证是否使用了正确的设备
-    if device.startswith("cuda") and torch.cuda.is_available():
-        # 尝试创建一个小的CUDA张量来测试CUDA是否工作
-        try:
-            test_tensor = torch.rand(1, 1000, device="cuda")
-            logger.info(f"CUDA测试成功，当前设备: {test_tensor.device}")
-            del test_tensor  # 释放测试张量
-        except Exception as e:
-            logger.warning(f"CUDA测试失败: {str(e)}")
-    
-except Exception as e:
-    logger.error(f"模型加载失败: {str(e)}")
-    logger.error(traceback.format_exc())
-    raise
+    Returns:
+        BytesIO对象，包含下载的音频数据
+    """
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            audio,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0"
+            },
+        ) as response:
+            if response.status != 200:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to download image: {response.status}",
+                )
+            image_bytes = await response.read()
+            return BytesIO(image_bytes)
 
-@app.get("/status")
-async def get_status():
-    """获取服务状态"""
-    try:
-        # 收集性能指标
-        metrics = PerformanceMonitor.get_metrics()
-        
-        # 获取GPU状态
-        gpu_available = torch.cuda.is_available()
-        gpu_info = {
-            "available": gpu_available,
-            "device_count": torch.cuda.device_count() if gpu_available else 0,
-            "current_device": device,
-            "device_name": torch.cuda.get_device_name(0) if gpu_available else "N/A"
-        }
-        
-        # 返回状态信息
-        return {
-            "status": "running",
-            "version": config.API_VERSION,
-            "gpu_status": gpu_info,
-            "metrics": metrics
-        }
-    except Exception as e:
-        logger.error(f"获取状态失败: {str(e)}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(500, f"获取状态失败: {str(e)}")
+class BatchApiResponse(BaseModel):
+    """批量API响应模型"""
+    message: str = Field(..., description="操作状态消息")
+    results: List[str] = Field(..., description="去除标签的输出列表")
+    label_result: List[str] = Field(..., description="原始输出列表")
 
-@app.post("/transcribe")
-@timer
-async def transcribe(
-    audio: UploadFile = File(..., description=f"音频文件({', '.join(config.SUPPORTED_AUDIO_FORMATS)})"),
-    language: str = "auto",
-    textnorm: str = "withitn"
+@app.post("/transcribe", response_model=Union[ApiResponse, BatchApiResponse])
+async def upload_url(
+    files: List[UploadFile] = Form(..., description="wav or mp3 audios in 16KHz"),
+    keys: str = Form(..., description="name of each audio joined with comma"),
+    lang: str = Form("auto", description="language of audio content")
 ):
     """
-    转写音频文件
+    处理批量音频文件的转录
     
-    - **audio**: 音频文件
-    - **language**: 语言设置 (auto/zh/en/ja...)
-    - **textnorm**: 文本规范化 (withitn/noitn)
+    Args:
+        files: 上传的音频文件列表，支持wav或mp3格式，采样率16KHz
+        keys: 每个音频文件的名称，以逗号分隔的字符串
+        lang: 音频内容的语言，默认为自动检测
+        
+    Returns:
+        包含转录结果的响应
     """
-    start_time = time.time()
+    # 检查文件列表是否为空
+    if not files:
+        raise HTTPException(400, detail={"error": "没有提供有效的音频文件"})
     
-    try:
-        # 验证文件类型
-        if not audio.filename.lower().endswith(config.SUPPORTED_AUDIO_FORMATS):
-            raise HTTPException(
-                400, 
-                f"仅支持以下格式: {', '.join(config.SUPPORTED_AUDIO_FORMATS)}"
-            )
-        
-        # 读取音频内容
-        content = await audio.read()
-        
-        # 直接处理音频数据，无需临时文件
+    # 解析keys参数
+    key_list = [key.strip() for key in keys.split(',') if key.strip()]
+    if len(key_list) != len(files):
+        raise HTTPException(400, detail={"error": "音频文件数量与keys参数数量不匹配"})
+    
+    results = []
+    label_results = []
+    
+    # 处理每个文件
+    for i, audio_file in enumerate(files):
         try:
-            # 处理音频数据（避免写入临时文件）
-            audio_tensor = audio_processor.process_audio_bytes(content)
-            
-            # 直接使用模型推理
-            results = model.inference([audio_tensor], language=language, use_itn=(textnorm == "withitn"))
-            
-            # 获取文本
-            text = results[0][0]["text"] if results and results[0] else ""
-            
-            # 计算总处理时间
-            total_time = time.time() - start_time
-            
-            # 构建结果
-            result = {
-                "status": "success",
-                "text": text,
-                "processing_time": total_time,
-                "device": device
-            }
-            
-            # 记录操作日志
-            OperationLogger.log_operation(
-                operation="转写请求",
-                status="success",
-                details={
-                    "filename": audio.filename,
-                    "language": language,
-                    "processing_time": total_time
-                }
-            )
-            
-            # 返回结果
-            return result
+            # 读取文件内容
+            audio = BytesIO(await audio_file.read())
+            # 使用指定的语言参数进行处理
+            res = model(audio, language=lang, use_itn=True)
+            results.append(rich_transcription_postprocess(res[0]))
+            label_results.append(res[0])
         except Exception as e:
-            logger.error(f"推理处理失败: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(500, f"推理处理失败: {str(e)}")
-    except Exception as e:
-        # 记录错误
-        logger.error(f"转写失败: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        # 记录操作日志
-        OperationLogger.log_operation(
-            operation="转写请求",
-            status="failure",
-            details={"filename": audio.filename if audio else "未知文件"},
-            error=e
-        )
-        
-        # 返回错误响应
-        raise HTTPException(500, str(e))
-
-@app.post("/api/v1/asr")
-async def turn_audio_to_text(
-    files: Annotated[List[bytes], File(description="wav或mp3音频文件，16KHz采样率")], 
-    keys: Annotated[str, Form(description="用逗号分隔的音频名称")] = "", 
-    lang: Annotated[Language, Form(description="音频内容的语言")] = "auto"
-):
-    """
-    批量转写音频文件 (兼容接口)
+            # 记录单个文件处理失败，但继续处理其他文件
+            results.append(f"处理文件 {key_list[i]} 时出错: {str(e)}")
+            label_results.append(f"错误: {str(e)}")
     
-    - **files**: 音频文件列表
-    - **keys**: 文件名列表（逗号分隔）
-    - **lang**: 语言设置
-    """
-    try:
-        start_time = time.time()
-        
-        # 解析键名
-        key_list = keys.split(",") if keys else []
-        
-        # 直接处理所有音频数据
-        audio_tensors = []
-        for file_data in files:
-            audio_tensor = audio_processor.process_audio_bytes(file_data)
-            audio_tensors.append(audio_tensor)
-        
-        # 批量推理
-        results = model.inference(
-            audio_tensors, 
-            language=lang, 
-            use_itn=True, 
-            key=key_list
-        )
-        
-        # 格式化结果
-        response = []
-        if results and results[0]:
-            for item in results[0]:
-                response.append({
-                    "key": item.get("key", ""),
-                    "value": item.get("text", "")
-                })
-        
-        # 计算总处理时间
-        total_time = time.time() - start_time
-        PerformanceMonitor.record_metric("batch_processing_time", total_time)
-        
-        # 记录操作日志
-        OperationLogger.log_operation(
-            operation="批量转写",
-            status="success",
-            details={
-                "file_count": len(files),
-                "language": lang,
-                "processing_time": total_time
-            }
-        )
-        
-        return response
-    except Exception as e:
-        # 记录错误
-        logger.error(f"批量转写失败: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        # 记录操作日志
-        OperationLogger.log_operation(
-            operation="批量转写",
-            status="failure",
-            error=e
-        )
-        
-        # 返回错误响应
-        raise HTTPException(500, str(e))
+    return {
+        "message": f"成功处理 {len(files)} 个音频文件",
+        "results": results,
+        "label_result": label_results
+    }
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     logger.info(f"启动API服务 127.0.0.1:8000")
-#     uvicorn.run(
-#         app, 
-#         host="0.0.0.0", 
-#         port=8000,
-#         workers=1,
-#         log_config=None
-#     )
+
+if __name__ == "__main__":
+
+    model_dir = "iic/SenseVoiceSmall"
+    device_id = DEVICE_ID  # Use GPU 0, automatically use CPU when not available
+    batch_size = 16
+    language = "auto"
+    quantize = False # Quantization model, small size, fast speed, accuracy may be insufficient: model_quant.onnx
+
+    def load_data(self, wav_content: Union[str, np.ndarray, List[str], BytesIO], fs: int = None) -> List:
+        def load_wav(path: str) -> np.ndarray:
+            waveform, _ = librosa.load(path, sr=fs)
+            return waveform
+
+        if isinstance(wav_content, np.ndarray):
+            return [wav_content]
+
+        if isinstance(wav_content, str):
+            return [load_wav(wav_content)]
+
+        if isinstance(wav_content, list):
+            return [load_wav(path) for path in wav_content]
+        
+        if isinstance(wav_content, BytesIO):
+            return [load_wav(wav_content)]
+        
+        raise TypeError(f"The type of {wav_content} is not in [str, np.ndarray, list]")
+    
+    SenseVoiceSmall.load_data = load_data
+
+    model = SenseVoiceSmall(
+        model_dir,
+        quantize=quantize,
+        device_id=device_id,
+        batch_size=batch_size
+        )
+
+    print("\n\nDocs: http://127.0.0.1:8000/docs\n")
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
