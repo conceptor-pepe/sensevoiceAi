@@ -1,0 +1,24 @@
+# 核心依赖
+fastapi>=0.115.12
+soundfile>=0.13.1
+python-multipart>=0.0.20
+librosa>=0.11.0
+pydantic>=2.11.4
+uvicorn>=0.34.2
+numpy>=1.26.4
+funasr-onnx>=0.4.1
+httpx>=0.28.1
+pydub>=0.25.1
+asyncio>=3.4.3
+python-magic>=0.4.27
+
+# 系统监控
+psutil>=5.9.5
+
+# 文档
+swagger-ui-bundle>=0.0.9
+
+# 工具和测试
+pytest>=7.3.1
+pytest-asyncio>=0.21.0
+httpx>=0.24.0 

@@ -1,9 +1,9 @@
 import librosa
 import numpy as np
 # import aiohttp # aiohttp 在当前代码片段中未被使用，如果后续需要可以取消注释
-from fastapi import FastAPI, Form, UploadFile, HTTPException
+from fastapi import FastAPI, Form, UploadFile, HTTPException, BackgroundTasks, Depends
 from pydantic import HttpUrl, ValidationError, BaseModel, Field
-from typing import List, Union, Any, Dict
+from typing import List, Union, Any, Dict, Optional
 from funasr_onnx import SenseVoiceSmall
 from funasr_onnx.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
@@ -12,11 +12,15 @@ import functools # 导入 functools 库，用于 functools.partial
 import concurrent.futures # 导入 concurrent.futures 模块，用于创建线程池
 import time # 导入 time 模块，用于时间统计
 import os # 导入 os 模块，用于文件和目录操作
+import psutil # 导入 psutil 模块，用于系统资源监控
 from datetime import datetime # 导入 datetime 模块，用于日期时间格式化
 
 # 导入配置和日志模块
 import config
 from logger import logger
+# 导入新添加的工具类
+from memory_utils import MemoryMonitor
+from audio_utils import AudioProcessor
 
 # --- Pydantic 模型定义 ---
 class ApiResponse(BaseModel):
@@ -33,6 +37,14 @@ class BatchApiResponse(BaseModel):
     label_result: List[str] = Field(..., description="原始输出结果列表，每个元素对应一个文件。") # label_result: 存储所有文件原始的、带标签的转录文本列表
     processing_time: float = Field(0.0, description="处理总时间（秒）") # processing_time: 处理所有音频文件所需的总时间（秒）
     file_times: List[float] = Field([], description="每个文件的处理时间（秒）") # file_times: 每个文件的处理时间列表
+
+# --- 全局并发控制 ---
+# request_semaphore: 控制并发请求数量的信号量
+request_semaphore = asyncio.Semaphore(config.REQUEST_SEMAPHORE_SIZE)
+# 已处理请求计数
+processed_request_count = 0
+# 被拒绝请求计数
+rejected_request_count = 0
 
 # --- SenseVoiceSmall 模型加载和猴子补丁 ---
 # 将 load_data 定义在全局作用域，以便模型初始化时使用
@@ -110,6 +122,8 @@ app = FastAPI() # app: FastAPI 应用的主实例
 async def startup_event():
     """应用程序启动时调用的事件处理器"""
     logger.info("SenseVoice API 服务启动")
+    # 记录初始内存状态
+    MemoryMonitor.log_memory_status()
 
 @app.on_event("shutdown")
 async def app_shutdown():
@@ -126,6 +140,54 @@ async def app_shutdown():
         logger.info("Model inference thread pool closed.") # 记录日志：线程池已关闭
     logger.info("SenseVoice API service closed")
 
+# --- 并发控制中间件 ---
+async def get_request_semaphore():
+    """
+    获取请求信号量的依赖函数
+    
+    如果内存不足或并发请求数已达最大值，将抛出异常
+    """
+    global rejected_request_count, processed_request_count
+    
+    # 检查内存状态
+    if not MemoryMonitor.is_memory_available():
+        rejected_request_count += 1
+        total_requests = processed_request_count + rejected_request_count
+        logger.warning(f"由于内存不足拒绝请求。已处理: {processed_request_count}, 已拒绝: {rejected_request_count}, 总请求: {total_requests}")
+        # 记录当前内存状态
+        MemoryMonitor.log_memory_status()
+        raise HTTPException(status_code=503, detail={"error": "服务器资源不足，请稍后重试"})
+    
+    # 尝试获取信号量，如果不可用（达到并发上限），则拒绝请求
+    if not request_semaphore.locked() and request_semaphore._value == 0:
+        rejected_request_count += 1
+        total_requests = processed_request_count + rejected_request_count
+        logger.warning(f"由于达到并发上限拒绝请求。已处理: {processed_request_count}, 已拒绝: {rejected_request_count}, 总请求: {total_requests}")
+        raise HTTPException(status_code=503, detail={"error": "服务器正忙，请稍后重试"})
+    
+    try:
+        # 尝试获取信号量（非阻塞）
+        if not request_semaphore.locked():
+            await request_semaphore.acquire()
+            return request_semaphore
+        else:
+            # 如果信号量已锁定，等待一段时间
+            try:
+                # 设置获取信号量的超时时间为5秒
+                await asyncio.wait_for(request_semaphore.acquire(), timeout=5.0)
+                return request_semaphore
+            except asyncio.TimeoutError:
+                # 获取超时，拒绝请求
+                rejected_request_count += 1
+                total_requests = processed_request_count + rejected_request_count
+                logger.warning(f"由于等待超时拒绝请求。已处理: {processed_request_count}, 已拒绝: {rejected_request_count}, 总请求: {total_requests}")
+                raise HTTPException(status_code=503, detail={"error": "服务器正忙，请稍后重试"})
+    except Exception as e:
+        # 处理其他异常
+        logger.error(f"获取请求信号量时发生错误: {str(e)}")
+        rejected_request_count += 1
+        raise HTTPException(status_code=500, detail={"error": f"服务器内部错误: {str(e)}"})
+
 # --- 异步辅助函数：处理单个音频文件 ---
 async def _process_audio_file(
     audio_file: UploadFile, # audio_file: 代表上传的单个音频文件的对象
@@ -136,6 +198,7 @@ async def _process_audio_file(
     """
     异步处理单个音频文件。
     模型推理部分将在专门的线程池中执行，以避免阻塞事件循环。
+    支持大文件分片处理。
     """
     # 记录开始处理时间
     file_start_time = time.time()
@@ -148,6 +211,13 @@ async def _process_audio_file(
         # 记录文件信息
         logger.info(f"开始处理文件: {key}, 大小: {file_size/1024:.2f} KB, 语言: {lang}")
         
+        # 检查是否为大文件
+        if AudioProcessor.is_large_file(audio_content):
+            # 如果是大文件，进行分片处理
+            logger.info(f"检测到大文件: {key}, 大小: {file_size/1024:.2f} KB, 进行分片处理")
+            return await _process_large_audio_file(audio_content, key, lang, model_instance)
+        
+        # 如果不是大文件，直接处理
         # audio_fp: 将字节内容包装成的 BytesIO 对象，方便模型读取和处理
         audio_fp = BytesIO(audio_content)
         
@@ -191,12 +261,92 @@ async def _process_audio_file(
         logger.info(f"File {key} processing failed, total time cost: {file_process_time:.4f} seconds")
         return e
 
+async def _process_large_audio_file(
+    audio_content: bytes,       # audio_content: 音频文件的二进制内容
+    key: str,                   # key: 与该音频文件关联的唯一标识符或名称
+    lang: str,                  # lang: 音频内容的语言代码 (例如 "auto", "zh", "en")
+    model_instance: SenseVoiceSmall # model_instance: SenseVoiceSmall 模型的实例
+) -> Union[tuple, Exception]:
+    """
+    处理大型音频文件，将其分片处理后合并结果
+    """
+    try:
+        # 分割音频文件
+        chunks = AudioProcessor.split_audio(audio_content)
+        logger.info(f"大文件 {key} 已分成 {len(chunks)} 个分片")
+        
+        # 收集每个分片的处理结果
+        chunk_results = []
+        
+        # 依次处理每个分片
+        for i, (chunk_data, start_time, end_time) in enumerate(chunks):
+            chunk_key = f"{key}_chunk_{i+1}_{start_time:.2f}_{end_time:.2f}"
+            logger.info(f"处理分片 {i+1}/{len(chunks)}: {chunk_key}")
+            
+            # 将分片数据包装成 BytesIO 对象
+            chunk_fp = BytesIO(chunk_data)
+            # 获取当前事件循环
+            loop = asyncio.get_event_loop()
+            # 创建偏函数
+            model_func_partial = functools.partial(model_instance, language=lang, use_itn=True)
+            
+            # 推理开始时间
+            inference_start_time = time.time()
+            
+            # 执行推理
+            try:
+                res = await loop.run_in_executor(
+                    model_executor,
+                    model_func_partial,
+                    chunk_fp
+                )
+                
+                # 处理推理结果
+                inference_time = time.time() - inference_start_time
+                processed_text = rich_transcription_postprocess(res[0])
+                raw_text = res[0]
+                
+                # 记录每个分片的结果
+                chunk_results.append({
+                    "processed_text": processed_text,
+                    "raw_text": raw_text,
+                    "process_time": inference_time,
+                    "start_time": start_time,
+                    "end_time": end_time
+                })
+                
+                logger.info(f"分片 {chunk_key} 处理完成，耗时: {inference_time:.4f} 秒")
+            except Exception as e:
+                # 记录分片处理错误
+                logger.error(f"处理分片 {chunk_key} 时出错: {str(e)}")
+                # 添加错误结果
+                chunk_results.append({
+                    "processed_text": f"[分片处理错误: {str(e)}]",
+                    "raw_text": f"[分片处理错误: {str(e)}]",
+                    "process_time": time.time() - inference_start_time,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "error": str(e)
+                })
+        
+        # 合并所有分片结果
+        merged_result = AudioProcessor.merge_transcriptions(chunk_results)
+        
+        # 返回合并后的结果
+        return merged_result["processed_text"], merged_result["raw_text"], merged_result["process_time"]
+    except Exception as e:
+        # 记录大文件处理错误
+        error_message = f"处理大文件 {key} 时出错: {str(e)}"
+        logger.error(error_message)
+        return e
+
 # --- API 端点 ---
 @app.post("/transcribe", response_model=BatchApiResponse) # 明确指定响应模型为 BatchApiResponse
 async def transcribeHandler(
     files: List[UploadFile] = Form(..., description="16KHz采样率的WAV或MP3格式音频文件列表"), # files: 用户上传的音频文件列表
     keys: str = Form(..., description="每个音频文件的名称（标识符），以逗号分隔"), # keys: 与文件列表对应的名称字符串
-    lang: str = Form("auto", description="音频内容的语言代码（例如 'auto', 'zh', 'en'）") # lang: 音频语言
+    lang: str = Form("auto", description="音频内容的语言代码（例如 'auto', 'zh', 'en'）"), # lang: 音频语言
+    semaphore: asyncio.Semaphore = Depends(get_request_semaphore) # 添加信号量依赖，用于并发控制
 ):
     """
     并发处理批量音频文件的转录。
@@ -205,46 +355,62 @@ async def transcribeHandler(
         files: 上传的音频文件列表 (UploadFile 对象)。
         keys: 每个音频文件的名称，以逗号分隔的字符串。
         lang: 音频内容的语言，默认为自动检测 ("auto")。
+        semaphore: 用于控制并发的信号量（通过依赖注入）
         
     Returns:
         BatchApiResponse: 包含所有文件转录结果（或错误信息）的响应。
     """
-    # 记录请求开始时间
-    request_start_time = time.time()
+    global processed_request_count
     
-    # 获取客户端IP地址 (简化处理)
-    client_ip = "未知IP"
-    
-    # 记录访问日志
-    logger.info(f"Request: client IP={client_ip}, file number={len(files)}, language={lang}")
-    
-    # 验证请求参数
-    key_list = _validate_request_params(files, keys, client_ip)
-    
-    # 创建并执行异步任务
-    all_task_results = await _execute_transcription_tasks(files, key_list, lang, model)
-    
-    # 处理任务结果
-    results = _process_task_results(all_task_results, key_list)
-    
-    # 计算总处理时间
-    total_process_time = time.time() - request_start_time
-    
-    # 生成响应消息
-    response_message = _generate_response_message(len(files), results["success_count"], 
-                                                results["failed_count"], total_process_time)
-    
-    # 记录性能统计信息
-    _log_performance_stats(results["file_times_list"], client_ip, total_process_time, 
-                          results["success_count"], results["failed_count"])
-    
-    return {
-        "message": response_message,
-        "results": results["results_list"],
-        "label_result": results["label_results_list"],
-        "processing_time": total_process_time,
-        "file_times": results["file_times_list"]
-    }
+    try:
+        # 记录请求开始时间
+        request_start_time = time.time()
+        
+        # 获取客户端IP地址 (简化处理)
+        client_ip = "未知IP"
+        
+        # 记录访问日志和当前内存状态
+        logger.info(f"Request: client IP={client_ip}, file number={len(files)}, language={lang}")
+        MemoryMonitor.log_memory_status()
+        
+        # 验证请求参数
+        key_list = _validate_request_params(files, keys, client_ip)
+        
+        # 创建并执行异步任务
+        all_task_results = await _execute_transcription_tasks(files, key_list, lang, model)
+        
+        # 处理任务结果
+        results = _process_task_results(all_task_results, key_list)
+        
+        # 计算总处理时间
+        total_process_time = time.time() - request_start_time
+        
+        # 生成响应消息
+        response_message = _generate_response_message(len(files), results["success_count"], 
+                                                    results["failed_count"], total_process_time)
+        
+        # 记录性能统计信息
+        _log_performance_stats(results["file_times_list"], client_ip, total_process_time, 
+                              results["success_count"], results["failed_count"])
+        
+        # 更新计数器
+        processed_request_count += 1
+        
+        # 构建响应
+        response = {
+            "message": response_message,
+            "results": results["results_list"],
+            "label_result": results["label_results_list"],
+            "processing_time": total_process_time,
+            "file_times": results["file_times_list"]
+        }
+        
+        return response
+    finally:
+        # 无论请求成功或失败，确保释放信号量
+        semaphore.release()
+        # 记录当前内存状态
+        MemoryMonitor.log_memory_status()
 
 def _validate_request_params(files: List[UploadFile], keys: str, client_ip: str) -> List[str]:
     """
@@ -266,6 +432,11 @@ def _validate_request_params(files: List[UploadFile], keys: str, client_ip: str)
         # 如果没有提供有效的音频文件，则引发HTTP 400错误
         logger.warning(f"Request error: client IP={client_ip}, no valid audio files provided")
         raise HTTPException(status_code=400, detail={"error": "没有提供有效的音频文件"})
+    
+    # 检查文件数量是否超过限制
+    if len(files) > config.MAX_FILES_PER_REQUEST:
+        logger.warning(f"Request error: client IP={client_ip}, too many files ({len(files)}), max allowed: {config.MAX_FILES_PER_REQUEST}")
+        raise HTTPException(status_code=400, detail={"error": f"单次请求文件数量超过限制，最大允许 {config.MAX_FILES_PER_REQUEST} 个文件"})
     
     # 解析keys参数，去除首尾空格，并过滤掉空字符串
     key_list = [key.strip() for key in keys.split(',') if key.strip()]
@@ -395,6 +566,48 @@ def _log_performance_stats(file_times: List[float], client_ip: str,
     # 记录访问日志 - 请求完成
     logger.info(f"handle: Client IP={client_ip}, Total cost={total_time:.4f}second, success={success_count}, failed={failed_count}")
 
+# --- 健康检查端点 ---
+@app.get("/health")
+async def health_check():
+    """
+    健康检查端点，返回服务状态信息
+    """
+    # 获取内存使用情况
+    memory_usage = MemoryMonitor.get_memory_usage()
+    # 获取当前进程
+    process = psutil.Process(os.getpid())
+    # 获取进程运行时间
+    process_uptime = time.time() - process.create_time()
+    # 获取系统负载
+    load_avg = psutil.getloadavg()
+    
+    # 计算服务状态
+    is_healthy = memory_usage < config.MEMORY_THRESHOLD
+    
+    # 构建响应
+    response = {
+        "status": "healthy" if is_healthy else "degraded",
+        "timestamp": datetime.now().isoformat(),
+        "memory": {
+            "usage": f"{memory_usage:.2%}",
+            "threshold": f"{config.MEMORY_THRESHOLD:.2%}"
+        },
+        "system": {
+            "load_avg": load_avg,
+            "cpu_percent": psutil.cpu_percent()
+        },
+        "service": {
+            "uptime": f"{process_uptime:.2f} seconds",
+            "processed_requests": processed_request_count,
+            "rejected_requests": rejected_request_count
+        }
+    }
+    
+    # 如果服务状态不健康，修改响应状态码
+    if not is_healthy:
+        return response
+    
+    return response
 
 # --- Uvicorn 服务器启动 (用于直接运行此脚本时) ---
 if __name__ == "__main__":
