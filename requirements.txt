@@ -13,7 +13,7 @@ asyncio>=3.4.3
 python-magic>=0.4.27
 
 # 系统监控
-psutil>=5.9.5
+psutil>=7.0.0
 
 # 文档
 swagger-ui-bundle>=0.0.9

@@ -19,22 +19,18 @@ from datetime import datetime # 导入 datetime 模块，用于日期时间格�
 import config
 from logger import logger
 # 导入新添加的工具类
-from memory_utils import MemoryMonitor
 from audio_utils import AudioProcessor
 
 # --- Pydantic 模型定义 ---
 class ApiResponse(BaseModel):
     """单文件API响应模型 (当前未使用，但保留定义以备将来扩展)"""
-    message: str = Field(..., description="状态消息，指示操作的成功。") # message: 操作状态消息
     results: str = Field(..., description="去除标签的输出。") # results: 去除时间戳和标点等标签后的文本结果
-    label_result: str = Field(..., description="默认输出。") # label_result: 原始的、带标签的文本结果
     processing_time: float = Field(0.0, description="处理时间（秒）") # processing_time: 处理音频文件所需的时间（秒）
 
 class BatchApiResponse(BaseModel):
     """批量API响应模型"""
-    message: str = Field(..., description="操作状态消息，可能包含成功和失败的计数。") # message: 操作状态消息，例如 "成功处理 X 个文件中的 Y 个，失败 Z 个"
     results: List[str] = Field(..., description="去除标签的输出结果列表，每个元素对应一个文件。") # results: 存储所有文件去除标签后的转录文本列表
-    label_result: List[str] = Field(..., description="原始输出结果列表，每个元素对应一个文件。") # label_result: 存储所有文件原始的、带标签的转录文本列表
+    # label_result: List[str] = Field(..., description="原始输出结果列表，每个元素对应一个文件。") # label_result: 存储所有文件原始的、带标签的转录文本列表
     processing_time: float = Field(0.0, description="处理总时间（秒）") # processing_time: 处理所有音频文件所需的总时间（秒）
     file_times: List[float] = Field([], description="每个文件的处理时间（秒）") # file_times: 每个文件的处理时间列表
 
@@ -109,6 +105,25 @@ model = SenseVoiceSmall(
 model_load_time = time.time() - model_load_start_time
 logger.info(f"Model loaded, time cost: {model_load_time:.4f} seconds")
 
+# 模型预热，提前执行一次推理以避免首次调用的延迟
+def warm_up_model():
+    """预热模型，避免首次推理的延迟"""
+    logger.info("开始模型预热...")
+    try:
+        # 创建一个小的空白音频进行预热
+        sample_rate = 16000  # 采样率
+        duration = 1  # 1秒音频
+        dummy_audio = np.zeros(sample_rate * duration, dtype=np.float32)
+        
+        # 执行模型推理
+        _ = model(dummy_audio, language="auto", use_itn=True)
+        logger.info("模型预热完成")
+    except Exception as e:
+        logger.error(f"模型预热失败: {str(e)}")
+
+# 执行模型预热
+warm_up_model()
+
 # --- 全局线程池执行器 ---
 # model_executor: 初始化一个全局的线程池执行器，专门用于处理模型推理等阻塞型CPU/GPU密集任务
 # max_workers=MODEL_WORKERS: 限制了同时执行模型推理的线程数量，对于GPU任务，通常设为1
@@ -122,8 +137,6 @@ app = FastAPI() # app: FastAPI 应用的主实例
 async def startup_event():
     """应用程序启动时调用的事件处理器"""
     logger.info("SenseVoice API 服务启动")
-    # 记录初始内存状态
-    MemoryMonitor.log_memory_status()
 
 @app.on_event("shutdown")
 async def app_shutdown():
@@ -145,18 +158,9 @@ async def get_request_semaphore():
     """
     获取请求信号量的依赖函数
     
-    如果内存不足或并发请求数已达最大值，将抛出异常
+    如果并发请求数已达最大值，将抛出异常
     """
     global rejected_request_count, processed_request_count
-    
-    # 检查内存状态
-    if not MemoryMonitor.is_memory_available():
-        rejected_request_count += 1
-        total_requests = processed_request_count + rejected_request_count
-        logger.warning(f"由于内存不足拒绝请求。已处理: {processed_request_count}, 已拒绝: {rejected_request_count}, 总请求: {total_requests}")
-        # 记录当前内存状态
-        MemoryMonitor.log_memory_status()
-        raise HTTPException(status_code=503, detail={"error": "服务器资源不足，请稍后重试"})
     
     # 尝试获取信号量，如果不可用（达到并发上限），则拒绝请求
     if not request_semaphore.locked() and request_semaphore._value == 0:
@@ -202,61 +206,60 @@ async def _process_audio_file(
     """
     # 记录开始处理时间
     file_start_time = time.time()
-    file_size = 0
     
     try:
-        # audio_content: 从 UploadFile 异步读取的音频文件字节内容
+        # 异步读取音频文件内容
         audio_content: bytes = await audio_file.read()
-        file_size = len(audio_content)
-        # 记录文件信息
-        logger.info(f"开始处理文件: {key}, 大小: {file_size/1024:.2f} KB, 语言: {lang}")
-        
+        fileReadTime = time.time() - file_start_time
+
+
         # 检查是否为大文件
         if AudioProcessor.is_large_file(audio_content):
-            # 如果是大文件，进行分片处理
-            logger.info(f"检测到大文件: {key}, 大小: {file_size/1024:.2f} KB, 进行分片处理")
             return await _process_large_audio_file(audio_content, key, lang, model_instance)
         
-        # 如果不是大文件，直接处理
-        # audio_fp: 将字节内容包装成的 BytesIO 对象，方便模型读取和处理
+        # 使用BytesIO代替文件IO，减少磁盘操作
         audio_fp = BytesIO(audio_content)
         
-        # 获取当前 asyncio 事件循环实例
+        # 获取当前事件循环
         loop = asyncio.get_event_loop()
-
-        # model_func_partial: 创建一个偏函数，预设 model_instance 的 language 和 use_itn 参数。
+        
+        # 创建偏函数，设置语言和文本规范化参数
         model_func_partial = functools.partial(model_instance, language=lang, use_itn=True)
         
-        # 记录模型推理开始
+        # 记录模型推理开始时间
         inference_start_time = time.time()
         
-        # res: 模型对音频文件进行语音识别的原始结果。
-        # 使用 loop.run_in_executor 将阻塞的 model_func_partial(audio_fp) 调用
-        # 放入我们定义的 model_executor 线程池中执行。
-        res = await loop.run_in_executor(
-            model_executor,     # executor: 使用全局定义的、固定大小的线程池
-            model_func_partial, # func: 要在线程池中执行的函数 (已绑定参数的偏函数)
-            audio_fp            # *args: 传递给 func 的位置参数 (这里是音频数据)
-        )
+        # 优化：缓存音频数据到NumPy数组以加速模型处理
+        # 将执行耗时的音频加载和模型推理放入线程池，避免阻塞事件循环
+        def prepare_and_infer():
+            try:
+                # 加载音频数据
+                waveform, _ = librosa.load(audio_fp, sr=16000)
+                # 执行模型推理
+                return model_func_partial(waveform)
+            except Exception as e:
+                logger.error(f"模型推理出错: {str(e)}")
+                raise e
+        
+        # 在线程池中执行音频处理和模型推理
+        res = await loop.run_in_executor(model_executor, prepare_and_infer)
         
         # 记录模型推理耗时
         inference_time = time.time() - inference_start_time
         
-        # processed_text: 对原始识别结果 res[0] 进行后处理（例如，去除标签、规范化文本格式）后的文本。
+        # 后处理模型输出
         processed_text: str = rich_transcription_postprocess(res[0])
-        # raw_text: 未经 rich_transcription_postprocess 处理的原始模型输出。
-        raw_text = res[0] # 通常 res[0] 直接就是原始的带标签文本或包含更丰富信息的结构
+        raw_text = res[0]
+        richTime = time.time() - inference_time
         
-        # 计算处理总耗时
+        # 计算总处理时间
         file_process_time = time.time() - file_start_time
-        logger.info(f"File {key} processed, model inference: {inference_time:.4f} seconds, total time cost: {file_process_time:.4f} seconds")
-
-        return processed_text, raw_text, file_process_time # 返回成功处理的结果和处理时间
+        logger.info(f"File {key} processed, model inference: {inference_time:.4f}S, ioRead cost: {fileReadTime:.4f}S, richTime: {richTime:.4f}S total: {file_process_time:.4f}S")
+        
+        return processed_text, raw_text, file_process_time
     except Exception as e:
-        # 记录错误
         error_message = f"Error occurred while processing file {key}: {str(e)}"
         logger.error(error_message)
-        # 计算处理总耗时（即使失败）
         file_process_time = time.time() - file_start_time
         logger.info(f"File {key} processing failed, total time cost: {file_process_time:.4f} seconds")
         return e
@@ -268,69 +271,110 @@ async def _process_large_audio_file(
     model_instance: SenseVoiceSmall # model_instance: SenseVoiceSmall 模型的实例
 ) -> Union[tuple, Exception]:
     """
-    处理大型音频文件，将其分片处理后合并结果
+    处理大型音频文件，将其分片并行处理后合并结果
+    采用并行处理多个分片以提高处理速度
     """
     try:
+        # 记录处理开始时间
+        start_time = time.time()
+        
         # 分割音频文件
         chunks = AudioProcessor.split_audio(audio_content)
         logger.info(f"大文件 {key} 已分成 {len(chunks)} 个分片")
         
-        # 收集每个分片的处理结果
-        chunk_results = []
+        # 创建每个分片的处理任务
+        chunk_tasks = []
         
-        # 依次处理每个分片
-        for i, (chunk_data, start_time, end_time) in enumerate(chunks):
-            chunk_key = f"{key}_chunk_{i+1}_{start_time:.2f}_{end_time:.2f}"
-            logger.info(f"处理分片 {i+1}/{len(chunks)}: {chunk_key}")
-            
-            # 将分片数据包装成 BytesIO 对象
-            chunk_fp = BytesIO(chunk_data)
-            # 获取当前事件循环
-            loop = asyncio.get_event_loop()
-            # 创建偏函数
-            model_func_partial = functools.partial(model_instance, language=lang, use_itn=True)
-            
-            # 推理开始时间
-            inference_start_time = time.time()
-            
-            # 执行推理
+        # 获取当前事件循环
+        loop = asyncio.get_event_loop()
+        
+        # 定义处理单个分片的函数
+        async def process_chunk(chunk_data, chunk_key, start_time, end_time):
+            """处理单个音频分片"""
             try:
-                res = await loop.run_in_executor(
-                    model_executor,
-                    model_func_partial,
-                    chunk_fp
-                )
+                # 将分片数据包装成BytesIO对象
+                chunk_fp = BytesIO(chunk_data)
                 
-                # 处理推理结果
+                # 创建偏函数
+                model_func_partial = functools.partial(model_instance, language=lang, use_itn=True)
+                
+                # 处理函数，将在线程池中执行
+                def prepare_and_infer_chunk():
+                    try:
+                        # 加载音频数据
+                        waveform, _ = librosa.load(chunk_fp, sr=16000)
+                        # 执行模型推理
+                        return model_func_partial(waveform)
+                    except Exception as e:
+                        logger.error(f"分片模型推理出错: {str(e)}")
+                        raise e
+                
+                # 记录分片推理开始时间
+                inference_start_time = time.time()
+                
+                # 在线程池中执行音频处理和模型推理
+                res = await loop.run_in_executor(model_executor, prepare_and_infer_chunk)
+                
+                # 后处理模型输出
                 inference_time = time.time() - inference_start_time
                 processed_text = rich_transcription_postprocess(res[0])
                 raw_text = res[0]
                 
-                # 记录每个分片的结果
-                chunk_results.append({
+                logger.info(f"分片 {chunk_key} 处理完成，耗时: {inference_time:.4f} 秒")
+                
+                return {
                     "processed_text": processed_text,
                     "raw_text": raw_text,
                     "process_time": inference_time,
                     "start_time": start_time,
                     "end_time": end_time
-                })
-                
-                logger.info(f"分片 {chunk_key} 处理完成，耗时: {inference_time:.4f} 秒")
+                }
             except Exception as e:
-                # 记录分片处理错误
                 logger.error(f"处理分片 {chunk_key} 时出错: {str(e)}")
-                # 添加错误结果
-                chunk_results.append({
+                return {
                     "processed_text": f"[分片处理错误: {str(e)}]",
                     "raw_text": f"[分片处理错误: {str(e)}]",
                     "process_time": time.time() - inference_start_time,
                     "start_time": start_time,
                     "end_time": end_time,
                     "error": str(e)
+                }
+        
+        # 为每个分片创建处理任务
+        for i, (chunk_data, start_time, end_time) in enumerate(chunks):
+            chunk_key = f"{key}_chunk_{i+1}_{start_time:.2f}_{end_time:.2f}"
+            task = process_chunk(chunk_data, chunk_key, start_time, end_time)
+            chunk_tasks.append(task)
+        
+        # 并发处理所有分片，获取结果
+        # 这里采用gather而不是as_completed，以保持分片的顺序
+        chunk_results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+        
+        # 处理结果，将异常转换为错误消息
+        chunk_results_processed = []
+        for i, result in enumerate(chunk_results):
+            if isinstance(result, Exception):
+                chunk_info = chunks[i]
+                start_time, end_time = chunk_info[1], chunk_info[2]
+                chunk_key = f"{key}_chunk_{i+1}_{start_time:.2f}_{end_time:.2f}"
+                logger.error(f"处理分片 {chunk_key} 时出错: {str(result)}")
+                chunk_results_processed.append({
+                    "processed_text": f"[分片处理错误: {str(result)}]",
+                    "raw_text": f"[分片处理错误: {str(result)}]",
+                    "process_time": 0.0,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "error": str(result)
                 })
+            else:
+                chunk_results_processed.append(result)
         
         # 合并所有分片结果
-        merged_result = AudioProcessor.merge_transcriptions(chunk_results)
+        merged_result = AudioProcessor.merge_transcriptions(chunk_results_processed)
+        
+        # 计算总处理时间
+        total_process_time = time.time() - start_time
+        logger.info(f"大文件 {key} 处理完成，总耗时: {total_process_time:.4f} 秒")
         
         # 返回合并后的结果
         return merged_result["processed_text"], merged_result["raw_text"], merged_result["process_time"]
@@ -366,12 +410,11 @@ async def transcribeHandler(
         # 记录请求开始时间
         request_start_time = time.time()
         
-        # 获取客户端IP地址 (简化处理)
+        # # 获取客户端IP地址 (简化处理)
         client_ip = "未知IP"
         
-        # 记录访问日志和当前内存状态
-        logger.info(f"Request: client IP={client_ip}, file number={len(files)}, language={lang}")
-        MemoryMonitor.log_memory_status()
+        # # 记录访问日志
+        # logger.info(f"Request: client IP={client_ip}, file number={len(files)}, language={lang}")
         
         # 验证请求参数
         key_list = _validate_request_params(files, keys, client_ip)
@@ -385,22 +428,18 @@ async def transcribeHandler(
         # 计算总处理时间
         total_process_time = time.time() - request_start_time
         
-        # 生成响应消息
-        response_message = _generate_response_message(len(files), results["success_count"], 
-                                                    results["failed_count"], total_process_time)
         
         # 记录性能统计信息
         _log_performance_stats(results["file_times_list"], client_ip, total_process_time, 
                               results["success_count"], results["failed_count"])
-        
+
         # 更新计数器
         processed_request_count += 1
         
         # 构建响应
         response = {
-            "message": response_message,
             "results": results["results_list"],
-            "label_result": results["label_results_list"],
+            # "label_result": results["label_results_list"],
             "processing_time": total_process_time,
             "file_times": results["file_times_list"]
         }
@@ -409,8 +448,6 @@ async def transcribeHandler(
     finally:
         # 无论请求成功或失败，确保释放信号量
         semaphore.release()
-        # 记录当前内存状态
-        MemoryMonitor.log_memory_status()
 
 def _validate_request_params(files: List[UploadFile], keys: str, client_ip: str) -> List[str]:
     """
@@ -471,7 +508,7 @@ async def _execute_transcription_tasks(files: List[UploadFile], key_list: List[s
         task = _process_audio_file(audio_file_item, current_file_key, lang, model_instance)
         tasks.append(task)
     
-    logger.info(f"Create {len(tasks)} async task")
+    # logger.info(f"Create {len(tasks)} async task")
     
     # 并发执行所有创建的任务
     return await asyncio.gather(*tasks, return_exceptions=True)
@@ -490,7 +527,7 @@ def _process_task_results(all_task_results: List[Any], key_list: List[str]) -> D
     # results_list: 存储所有文件去除标签后的转录文本的列表
     results_list: List[str] = []
     # label_results_list: 存储所有文件原始带标签转录文本的列表
-    label_results_list: List[str] = []
+    # label_results_list: List[str] = []
     # file_times_list: 存储每个文件处理时间的列表
     file_times_list: List[float] = []
     # success_count: 成功处理的文件数量
@@ -505,14 +542,14 @@ def _process_task_results(all_task_results: List[Any], key_list: List[str]) -> D
             # error_message: 格式化的错误消息字符串
             error_message = f"File processing error: file={current_key_for_result}, error={str(task_result_item)}"
             results_list.append(error_message) # 将错误信息添加到结果列表
-            label_results_list.append(f"错误: {str(task_result_item)}") # 将更简洁的错误信息添加到标签结果列表
-            file_times_list.append(0.0) # 对于失败的处理添加0作为处理时间
+            # label_results_list.append(f"错误: {str(task_result_item)}") # 将更简洁的错误信息添加到标签结果列表
+            # file_times_list.append(0.0) # 对于失败的处理添加0作为处理时间
             logger.error(f"File processing error: file={current_key_for_result}, error={str(task_result_item)}")
         else:
             # 如果任务结果不是异常，说明文件处理成功，task_result_item 是 (processed_text, raw_text, process_time) 元组
             processed_text, raw_text, process_time = task_result_item
             results_list.append(processed_text) # 添加成功处理的文本
-            label_results_list.append(raw_text) # 添加原始输出
+            # label_results_list.append(raw_text) # 添加原始输出
             file_times_list.append(process_time) # 添加处理时间
             success_count += 1 # 成功计数增加
     
@@ -521,29 +558,11 @@ def _process_task_results(all_task_results: List[Any], key_list: List[str]) -> D
     
     return {
         "results_list": results_list,
-        "label_results_list": label_results_list,
+        # "label_results_list": label_results_list,
         "file_times_list": file_times_list,
         "success_count": success_count,
         "failed_count": failed_count
     }
-
-def _generate_response_message(total_files: int, success_count: int, 
-                             failed_count: int, total_time: float) -> str:
-    """
-    生成响应消息，总结处理情况。
-    
-    Args:
-        total_files: 总文件数
-        success_count: 成功处理的文件数
-        failed_count: 处理失败的文件数
-        total_time: 总处理时间
-        
-    Returns:
-        str: 格式化的响应消息
-    """
-    response_message = f"Total {total_files} audio files processed. Success: {success_count} files, Failed: {failed_count} files. Total time cost: {total_time:.4f} seconds."
-    logger.info(response_message)
-    return response_message
 
 def _log_performance_stats(file_times: List[float], client_ip: str, 
                          total_time: float, success_count: int, failed_count: int) -> None:
@@ -572,29 +591,22 @@ async def health_check():
     """
     健康检查端点，返回服务状态信息
     """
-    # 获取内存使用情况
-    memory_usage = MemoryMonitor.get_memory_usage()
     # 获取当前进程
     process = psutil.Process(os.getpid())
     # 获取进程运行时间
     process_uptime = time.time() - process.create_time()
     # 获取系统负载
     load_avg = psutil.getloadavg()
-    
-    # 计算服务状态
-    is_healthy = memory_usage < config.MEMORY_THRESHOLD
+    # 获取CPU使用率
+    cpu_percent = psutil.cpu_percent()
     
     # 构建响应
     response = {
-        "status": "healthy" if is_healthy else "degraded",
+        "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "memory": {
-            "usage": f"{memory_usage:.2%}",
-            "threshold": f"{config.MEMORY_THRESHOLD:.2%}"
-        },
         "system": {
             "load_avg": load_avg,
-            "cpu_percent": psutil.cpu_percent()
+            "cpu_percent": cpu_percent
         },
         "service": {
             "uptime": f"{process_uptime:.2f} seconds",
@@ -602,10 +614,6 @@ async def health_check():
             "rejected_requests": rejected_request_count
         }
     }
-    
-    # 如果服务状态不健康，修改响应状态码
-    if not is_healthy:
-        return response
     
     return response
 

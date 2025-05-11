@@ -32,18 +32,10 @@ class AudioProcessor:
             float: 音频时长(秒)
         """
         try:
-            # 创建临时文件保存音频数据
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                temp_filename = temp_file.name
-                temp_file.write(audio_data)
-            
-            # 加载音频并获取时长
-            y, sr = librosa.load(temp_filename, sr=None)
+            # 使用内存IO避免磁盘IO操作
+            audio_io = io.BytesIO(audio_data)
+            y, sr = librosa.load(audio_io, sr=None)
             duration = librosa.get_duration(y=y, sr=sr)
-            
-            # 删除临时文件
-            os.unlink(temp_filename)
-            
             return duration
         except Exception as e:
             logger.error(f"获取音频时长失败: {str(e)}")
@@ -77,7 +69,7 @@ class AudioProcessor:
     @staticmethod
     def split_audio(audio_data: bytes, chunk_size_sec: float = None) -> List[Tuple[bytes, float, float]]:
         """
-        将音频文件分片
+        将音频文件分片，使用内存操作代替磁盘IO
         
         Args:
             audio_data: 音频文件的二进制数据
@@ -90,13 +82,11 @@ class AudioProcessor:
             chunk_size_sec = config.LARGE_FILE_CHUNK_SIZE_SEC
             
         try:
-            # 创建临时文件保存音频数据
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                temp_filename = temp_file.name
-                temp_file.write(audio_data)
+            # 使用内存IO代替临时文件
+            audio_io = io.BytesIO(audio_data)
             
             # 使用pydub加载音频
-            audio = AudioSegment.from_file(temp_filename)
+            audio = AudioSegment.from_file(audio_io)
             # 总时长(毫秒)
             total_duration = len(audio)
             # 分片大小(毫秒)
@@ -109,25 +99,15 @@ class AudioProcessor:
                 end_ms = min(start_ms + chunk_size_ms, total_duration)
                 chunk = audio[start_ms:end_ms]
                 
-                # 将分片保存为临时wav文件
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as chunk_file:
-                    chunk_filename = chunk_file.name
-                    chunk.export(chunk_filename, format="wav")
-                    
-                    # 读取分片文件数据
-                    with open(chunk_filename, 'rb') as f:
-                        chunk_data = f.read()
-                    
-                    # 将分片数据、开始时间和结束时间添加到列表
-                    start_sec = start_ms / 1000.0
-                    end_sec = end_ms / 1000.0
-                    chunks.append((chunk_data, start_sec, end_sec))
-                    
-                    # 删除临时分片文件
-                    os.unlink(chunk_filename)
-            
-            # 删除原始临时文件
-            os.unlink(temp_filename)
+                # 使用内存IO而不是临时文件
+                chunk_io = io.BytesIO()
+                chunk.export(chunk_io, format="wav")
+                chunk_data = chunk_io.getvalue()
+                
+                # 将分片数据、开始时间和结束时间添加到列表
+                start_sec = start_ms / 1000.0
+                end_sec = end_ms / 1000.0
+                chunks.append((chunk_data, start_sec, end_sec))
             
             logger.info(f"音频文件已分成 {len(chunks)} 个分片")
             return chunks
@@ -139,7 +119,7 @@ class AudioProcessor:
     @staticmethod
     def merge_transcriptions(chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        合并多个分片的转写结果
+        合并多个分片的转写结果，优化合并逻辑
         
         Args:
             chunk_results: 各个分片的转写结果列表
@@ -158,22 +138,29 @@ class AudioProcessor:
             "process_time": 0.0
         }
         
-        # 合并文本和处理时间
+        # 一次性预先分配数组，避免多次字符串拼接
+        processed_texts = []
+        raw_texts = []
+        total_process_time = 0.0
+        
+        # 收集每个分片的结果
         for chunk in chunk_results:
             processed_text = chunk.get("processed_text", "")
             raw_text = chunk.get("raw_text", "")
             process_time = chunk.get("process_time", 0.0)
             
-            # 添加空格连接文本(如果两段文本都不为空)
-            if merged_result["processed_text"] and processed_text:
-                merged_result["processed_text"] += " "
-            merged_result["processed_text"] += processed_text
-            
-            if merged_result["raw_text"] and raw_text:
-                merged_result["raw_text"] += " "
-            merged_result["raw_text"] += raw_text
+            # 收集文本和处理时间
+            if processed_text:
+                processed_texts.append(processed_text)
+            if raw_text:
+                raw_texts.append(raw_text)
             
             # 累加处理时间
-            merged_result["process_time"] += process_time
+            total_process_time += process_time
+        
+        # 一次性拼接
+        merged_result["processed_text"] = " ".join(processed_texts)
+        merged_result["raw_text"] = " ".join(raw_texts)
+        merged_result["process_time"] = total_process_time
         
         return merged_result 
